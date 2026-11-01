@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cloudflare 免费额度用量面板
 // @namespace    https://dash.cloudflare.com/cf-free-usage
-// @version      1.0.0
+// @version      1.1.0
 // @description  在 Cloudflare 控制台里用进度条直观查看 Workers / KV / D1 / R2 / Queues / DO / Workers AI 等免费额度的实时使用量
 // @author       chauncey
 // @match        https://dash.cloudflare.com/*
@@ -18,14 +18,14 @@
  * 工作原理
  * ---------
  * 数据来源是 Cloudflare 官方的 GraphQL Analytics API（账号级 dataset），
- * 也就是控制台图表背后的同一套接口：
+ * 也就是控制台图表背后的同一套接口。两种取数模式：
  *
- *   1) 会话模式（默认，零配置）：直接复用当前 dash.cloudflare.com 的登录 Cookie，
- *      请求 https://dash.cloudflare.com/api/v4/graphql（同源，浏览器自动带 Cookie，
- *      并附带 XSRF-TOKEN -> X-CSRF-Token 头）。
- *   2) Token 模式：在面板设置里粘贴一个只读 API Token（权限：Account Analytics : Read），
- *      脚本用 GM_xmlhttpRequest 直接请求 https://api.cloudflare.com/client/v4/graphql。
- *      Token 只保存在本地油猴存储里，不经手任何第三方。
+ *   1) Token 模式（推荐 / 稳定）：粘贴一个只读 API Token（Account Analytics : Read），
+ *      脚本用 GM_xmlhttpRequest 直连 https://api.cloudflare.com/client/v4/graphql。
+ *      令牌只存在本机油猴存储，不经手任何第三方。
+ *   2) 会话模式（零配置，视账号而定）：复用 dash.cloudflare.com 的登录 Cookie，
+ *      POST /api/v4/graphql。控制台对脚本发起的写/查请求有 CSRF 与风控校验，
+ *      部分账号会被 403 拒绝 —— 此时面板会直接提示切换 Token 模式，而不是静默变空。
  *
  * 免费额度数值来自 https://www.cloudflare.com/plans 的 Free Tier Summary，
  * 若官方调整额度，改下面 LIMITS 即可。
@@ -35,6 +35,7 @@
   'use strict';
 
   const GB = 1024 ** 3;
+  const VERSION = '1.1.0';
 
   /* =========================================================================
    * 1. 免费额度配置（来源：cloudflare.com/plans - Free Tier Summary）
@@ -83,7 +84,7 @@
   const KEY = {
     mode: 'cfu.mode', token: 'cfu.token', account: 'cfu.account',
     accounts: 'cfu.accounts', snapshot: 'cfu.snapshot', open: 'cfu.open',
-    interval: 'cfu.interval', hideFailed: 'cfu.hideFailed',
+    interval: 'cfu.interval',
   };
 
   const store = {
@@ -111,6 +112,7 @@
   const isoDate = (d) => d.toISOString().slice(0, 10);
   const pad2 = (n) => String(n).padStart(2, '0');
   const hhmmss = (d) => `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+  const clip = (s, n = 180) => String(s == null ? '' : s).replace(/\s+/g, ' ').slice(0, n);
 
   function fmtCount(n) {
     if (!isFinite(n)) return '—';
@@ -132,9 +134,21 @@
   const fmt = (kind, n) => (kind === 'bytes' ? fmtBytes(n) : fmtCount(n));
 
   /* =========================================================================
-   * 3. GraphQL 传输层（会话 Cookie / API Token 双模式）
+   * 3. GraphQL 传输层（Token / 会话 Cookie 双模式 + 详细错误信息）
    * ========================================================================= */
-  const isTokenMode = () => store.get(KEY.mode, 'session') === 'token';
+  class GQLError extends Error {
+    constructor(message, info) {
+      super(message);
+      this.name = 'GQLError';
+      this.status = info?.status || 0;
+      this.body = info?.body || '';
+      this.hint = info?.hint || '';
+      this.authError = !!(this.status === 401 || this.status === 403)
+        || /authentication error|unauthorized|not authorized|session has expired|invalid (api )?token|permission|权限|登录/i.test(message);
+    }
+  }
+
+  const isTokenMode = () => store.get(KEY.mode, 'token') === 'token';
   const getToken = () => String(store.get(KEY.token, '') || '').trim();
 
   function csrfToken() {
@@ -145,11 +159,11 @@
   function gmRequest({ method = 'GET', url, headers = {}, data, timeout = 20000 }) {
     return new Promise((resolve, reject) => {
       if (typeof GM_xmlhttpRequest !== 'function') {
-        reject(new Error('GM_xmlhttpRequest 不可用，无法使用 Token 模式'));
+        reject(new Error('GM_xmlhttpRequest 不可用'));
         return;
       }
       GM_xmlhttpRequest({
-        method, url, headers, data, timeout,
+        method, url, headers, data, timeout, anonymous: false,
         onload: (r) => {
           let json = null;
           try { json = JSON.parse(r.responseText); } catch (e) { /* 非 JSON */ }
@@ -161,53 +175,92 @@
     });
   }
 
-  function unwrapGraphQL(body) {
-    if (!body) throw new Error('空响应');
-    // dash 的 REST 信封 { success, errors, result } 与标准 { data, errors } 都要兼容
+  function unwrapGraphQL(body, info) {
+    if (!body) throw new GQLError(`响应不是 JSON（HTTP ${info.status}）：${clip(info.body)}`, info);
+    // dash 的 REST 信封 { success, errors, result } 与标准 { data, errors } 都兼容
     const env = body.data && typeof body.data === 'object'
       ? body
       : (body.result && body.result.data ? body.result : null);
     if (!env) {
       const e = (body.errors && body.errors[0]) || null;
       const msg = (e && (e.message || e.code)) || body.message || '未知错误';
-      throw new Error(String(msg));
+      throw new GQLError(String(msg), info);
     }
-    if (env.errors && env.errors.length) throw new Error(String(env.errors[0].message || '数据集不可用'));
-    if (!env.data) throw new Error('响应缺少 data');
+    if (env.errors && env.errors.length) {
+      throw new GQLError(String(env.errors[0].message || '数据集不可用'), info);
+    }
+    if (!env.data) throw new GQLError('响应缺少 data 字段', info);
     return env.data;
   }
 
-  async function gql(query) {
-    if (isTokenMode()) {
-      const token = getToken();
-      if (!token) throw new Error('未配置 API Token');
+  // Token 模式：GM_xmlhttpRequest 直连官方 API，绕开页面 CSP
+  async function gqlViaToken(query) {
+    const token = getToken();
+    if (!token) throw new GQLError('未配置 API Token，请到「设置」填入', { hint: 'token-empty' });
+    const res = await gmRequest({
+      method: 'POST',
+      url: 'https://api.cloudflare.com/client/v4/graphql',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      data: JSON.stringify({ query }),
+      timeout: 20000,
+    });
+    const info = { status: res.status, body: res.text };
+    if (res.status === 401 || res.status === 403) {
+      throw new GQLError('Token 无效或权限不足（需要 Account Analytics : Read）', info);
+    }
+    return unwrapGraphQL(res.json, info);
+  }
+
+  // 会话模式：同源 fetch 复用 Cookie；失败时再退一步用 GM 请求（不带页面 fetch 特征）
+  async function gqlViaSession(query) {
+    const csrf = csrfToken();
+    const baseHeaders = { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf, 'X-XSRF-Token': csrf };
+    let firstErr = null;
+
+    try {
+      const res = await fetch('/api/v4/graphql', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: baseHeaders,
+        body: JSON.stringify({ query }),
+      });
+      let json = null;
+      try { json = await res.json(); } catch (e) { /* 非 JSON */ }
+      if (res.status === 200 || json) {
+        const info = { status: res.status, body: json ? JSON.stringify(json) : '' };
+        return unwrapGraphQL(json, info);
+      }
+      firstErr = new GQLError(`HTTP ${res.status}`, { status: res.status });
+    } catch (e) {
+      firstErr = e instanceof GQLError ? e : new GQLError(`请求失败：${e.message}`);
+    }
+
+    // 回退：用扩展发起的请求（Cookie 同样附带，但不是页面 fetch 指纹）
+    try {
       const res = await gmRequest({
         method: 'POST',
-        url: 'https://api.cloudflare.com/client/v4/graphql',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        url: 'https://dash.cloudflare.com/api/v4/graphql',
+        headers: baseHeaders,
         data: JSON.stringify({ query }),
         timeout: 20000,
       });
-      if (res.status === 401 || res.status === 403) {
-        throw new Error('Token 无效或权限不足（需要 Account Analytics : Read）');
+      const info = { status: res.status, body: res.text };
+      if (res.status === 403) {
+        throw new GQLError(
+          csrf
+            ? '控制台接口拒绝脚本请求（403），请改用 Token 模式'
+            : '控制台接口拒绝脚本请求（403，且页面读不到 XSRF-TOKEN），请改用 Token 模式',
+          { ...info, hint: 'use-token' },
+        );
       }
-      if (!res.json) throw new Error(`HTTP ${res.status}，响应非 JSON`);
-      return unwrapGraphQL(res.json);
+      return unwrapGraphQL(res.json, info);
+    } catch (e) {
+      throw e instanceof GQLError ? e : firstErr;
     }
+  }
 
-    const res = await fetch('/api/v4/graphql', {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken() },
-      body: JSON.stringify({ query }),
-    });
-    let json = null;
-    try { json = await res.json(); } catch (e) { /* ignore */ }
-    if (!res.ok && !json) throw new Error(`HTTP ${res.status}`);
-    if (res.status === 403 && json && json.errors && json.errors[0] && json.errors[0].code === 10000) {
-      throw new Error('登录状态失效，请先在控制台登录');
-    }
-    return unwrapGraphQL(json);
+  async function gql(query) {
+    return isTokenMode() ? gqlViaToken(query) : gqlViaSession(query);
   }
 
   async function apiGet(pathAndQuery) {
@@ -222,7 +275,7 @@
       if (!res.json.success) throw new Error(res.json.errors?.[0]?.message || `HTTP ${res.status}`);
       return res.json.result;
     }
-    const res = await fetch(`/api/v4${pathAndQuery}`, { credentials: 'include' });
+    const res = await fetch(`/api/v4${pathAndQuery}`, { credentials: 'same-origin' });
     const json = await res.json().catch(() => null);
     if (!json || !json.success) throw new Error(json?.errors?.[0]?.message || `HTTP ${res.status}`);
     return json.result;
@@ -231,9 +284,11 @@
   /* =========================================================================
    * 4. 各产品的采集任务
    *    每个任务可有多个 query 变体：字段名/过滤类型在不同账号 schema 上
-   *    略有差异，前一个失败则自动降级到下一个，避免整块数据变空。
+   *    略有差异，前一个失败则自动降级到下一个；成功的变体会被记住，
+   *    下次刷新优先用它，避免每轮都重复踩坑。
    * ========================================================================= */
   const P = (c, body) => `{viewer{accounts(filter:{accountTag:"${c.acc}"}){${body}}}}`;
+  const variantPick = new Map();
 
   const R2_CLASS_A = new Set([
     'PutObject', 'CopyObject', 'CreateMultipartUpload', 'CompleteMultipartUpload', 'UploadPart',
@@ -338,6 +393,8 @@
       id: 'r2Ops', name: 'R2 操作', keys: ['r2ClassA', 'r2ClassB'],
       variants: [{
         build: (c) => P(c, `r2OperationsAdaptiveGroups(limit:1000,filter:{datetime_geq:"${c.monthStart}",datetime_lt:"${c.monthEnd}"}){dimensions{actionType} sum{requests}}`),
+        // Class A/B 的归类由本地规则推断
+        approx: true,
         extract: (d) => {
           const rows = account0(d).r2OperationsAdaptiveGroups || [];
           let a = 0;
@@ -348,7 +405,6 @@
           }
           return { r2ClassA: a, r2ClassB: b };
         },
-        approx: true, // Class A/B 的归类由本地规则推断
       }],
     },
     {
@@ -416,14 +472,21 @@
     };
   }
 
+  // 优先尝试上次成功的变体，失败再依次尝试其余变体
   async function runJob(job, ctx) {
+    const preferred = variantPick.get(job.id) || 0;
+    const order = [preferred, ...job.variants.keys()].filter((v, i, arr) => arr.indexOf(v) === i);
     let lastErr = null;
-    for (const variant of job.variants) {
+    for (const idx of order) {
+      const variant = job.variants[idx];
+      if (!variant) continue;
       try {
         const data = await gql(variant.build(ctx));
+        variantPick.set(job.id, idx);
         return { values: variant.extract(data), approx: !!variant.approx };
       } catch (e) {
         lastErr = e;
+        if (e.authError) break; // 鉴权类错误换变体也没用，直接上抛
       }
     }
     throw lastErr || new Error('采集失败');
@@ -431,20 +494,41 @@
 
   async function collect(accountId) {
     const ctx = buildCtx(accountId);
-    const result = { values: {}, approx: {}, failed: {}, ts: Date.now() };
+    const result = { values: {}, approx: {}, failed: {}, diag: [], ts: Date.now() };
+    const done = new Set();
+    let authError = null;
 
     for (let i = 0; i < JOBS.length; i += 3) {
       const batch = JOBS.slice(i, i + 3);
       const settled = await Promise.allSettled(batch.map((job) => runJob(job, ctx)));
       settled.forEach((s, idx) => {
         const job = batch[idx];
+        done.add(job.id);
         if (s.status === 'fulfilled') {
           Object.assign(result.values, s.value.values);
           if (s.value.approx) for (const k of job.keys) result.approx[k] = true;
         } else {
-          for (const k of job.keys) result.failed[k] = String(s.reason?.message || s.reason || '不可用');
+          const err = s.reason;
+          for (const k of job.keys) result.failed[k] = clip(err?.message || err, 140);
+          result.diag.push({
+            job: job.id,
+            status: err?.status || 0,
+            message: clip(err?.message || err, 240),
+            body: clip(err?.body, 240),
+          });
+          if (err?.authError && !authError) authError = err;
         }
       });
+      if (authError) break; // 鉴权失败就不再打剩下的请求
+    }
+
+    if (authError) {
+      result.authError = clip(authError.message, 200);
+      result.authHint = authError.hint || (isTokenMode() ? 'token-invalid' : 'use-token');
+      for (const job of JOBS) {
+        if (done.has(job.id)) continue;
+        for (const k of job.keys) result.failed[k] = '鉴权失败，已中止';
+      }
     }
     return result;
   }
@@ -465,7 +549,7 @@
     .launcher:hover { transform: translateY(-2px); box-shadow: 0 10px 26px rgba(246,130,31,.45); }
     .panel {
       position: fixed; right: 22px; bottom: 22px; z-index: 2147483000;
-      width: 392px; max-height: min(76vh, 720px); display: flex; flex-direction: column;
+      width: 396px; max-height: min(78vh, 760px); display: flex; flex-direction: column;
       background: #16181d; color: #e7e9ee; border: 1px solid #2a2e37; border-radius: 14px;
       box-shadow: 0 18px 50px rgba(0,0,0,.55); overflow: hidden; font-size: 13px;
     }
@@ -480,13 +564,21 @@
     .btn {
       border: 1px solid #333846; background: #23272f; color: #cfd4de; cursor: pointer;
       border-radius: 8px; padding: 4px 9px; font-size: 12px; line-height: 1.4; transition: .15s;
+      font-family: inherit;
     }
     .btn:hover { background: #2c313b; color: #fff; border-color: #454b5b; }
+    .btn:disabled { opacity: .55; cursor: default; }
+    .btn.primary { background: #f6821f; border-color: #f6821f; color: #1a1207; font-weight: 650; }
+    .btn.primary:hover { background: #ff9330; border-color: #ff9330; }
     .meta { padding: 8px 14px; font-size: 11.5px; color: #8b93a3; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
     .meta b { color: #b9c0cd; font-weight: 600; }
     .body { padding: 4px 14px 14px; overflow-y: auto; }
-    .body::-webkit-scrollbar { width: 8px; }
-    .body::-webkit-scrollbar-thumb { background: #333846; border-radius: 8px; }
+    .body::-webkit-scrollbar, .cfg::-webkit-scrollbar, .diag::-webkit-scrollbar { width: 8px; }
+    .body::-webkit-scrollbar-thumb, .cfg::-webkit-scrollbar-thumb, .diag::-webkit-scrollbar-thumb { background: #333846; border-radius: 8px; }
+    .banner { margin: 8px 0 4px; padding: 10px 11px; border-radius: 10px; font-size: 11.5px; line-height: 1.7;
+      background: #2a1f14; border: 1px solid #5a3d18; color: #f0c08a; }
+    .banner b { color: #ffb260; }
+    .banner .acts { display: flex; gap: 8px; margin-top: 8px; }
     .sec { margin-top: 12px; }
     .sec-h { display: flex; align-items: baseline; gap: 8px; font-size: 11px; letter-spacing: .6px;
       color: #7f8798; text-transform: uppercase; margin-bottom: 8px; }
@@ -505,19 +597,25 @@
     .row.dead .name { color: #6b7280; }
     .row.dead .bar { background: repeating-linear-gradient(90deg, #23262e, #23262e 4px, #1c1f26 4px, #1c1f26 8px); }
     .row.dead .pct { color: #6b7280; font-weight: 500; font-size: 11px; }
-    .foot { padding: 8px 14px 12px; font-size: 10.5px; color: #5f6674; border-top: 1px solid #22252c; }
-    .empty { padding: 22px 6px; text-align: center; color: #8b93a3; font-size: 12px; line-height: 1.7; }
-    .empty code { background: #23272f; padding: 1px 5px; border-radius: 4px; color: #d3a06a; }
-    .cfg { padding: 4px 14px 16px; }
-    .cfg h4 { margin: 12px 0 8px; font-size: 12px; color: #c8cdd8; font-weight: 600; }
-    .cfg label { display: flex; gap: 8px; align-items: flex-start; font-size: 12px; color: #a7aebc; margin-bottom: 8px; cursor: pointer; line-height: 1.5; }
-    .cfg input[type=text], .cfg input[type=password], .cfg select, .cfg input[type=number] {
+    .row.dead .val { color: #5b6270; }
+    .foot { padding: 8px 0 2px; font-size: 10.5px; color: #5f6674; border-top: 1px solid #22252c; margin-top: 10px; }
+    .empty { padding: 22px 6px; text-align: center; color: #8b93a3; font-size: 12px; line-height: 1.8; }
+    .empty code, .cfg code, .banner code { background: #23272f; padding: 1px 5px; border-radius: 4px; color: #d3a06a; font-size: 11px; }
+    .cfg { padding: 4px 14px 16px; overflow-y: auto; }
+    .cfg h4 { margin: 14px 0 8px; font-size: 12px; color: #c8cdd8; font-weight: 600; }
+    .cfg h4:first-child { margin-top: 8px; }
+    .cfg label { display: flex; gap: 8px; align-items: flex-start; font-size: 12px; color: #a7aebc; margin-bottom: 8px; cursor: pointer; line-height: 1.55; }
+    .cfg label b { color: #d6dae2; font-weight: 600; }
+    .cfg input[type=text], .cfg input[type=password], .cfg select {
       width: 100%; background: #1d2027; border: 1px solid #333846; color: #e7e9ee;
-      border-radius: 8px; padding: 7px 9px; font-size: 12px; outline: none;
+      border-radius: 8px; padding: 7px 9px; font-size: 12px; outline: none; font-family: inherit;
     }
     .cfg input:focus, .cfg select:focus { border-color: #f6821f; }
-    .cfg .hint { font-size: 10.5px; color: #6f7787; line-height: 1.6; margin: 6px 0 10px; }
-    .cfg .ops { display: flex; gap: 8px; margin-top: 12px; }
+    .cfg .hint { font-size: 10.5px; color: #6f7787; line-height: 1.65; margin: 6px 0 10px; }
+    .cfg .ops { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+    .diag { margin-top: 10px; max-height: 150px; overflow: auto; background: #101216; border: 1px solid #262a33;
+      border-radius: 8px; padding: 8px 10px; font-size: 10.5px; color: #97a0b0; line-height: 1.6; white-space: pre-wrap;
+      word-break: break-all; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
     .toast { position: absolute; left: 14px; right: 14px; bottom: 12px; padding: 8px 10px; border-radius: 8px;
       background: #2a1d1d; border: 1px solid #54302f; color: #f0a9a2; font-size: 11.5px; display: none; }
     .toast.on { display: block; }
@@ -607,13 +705,14 @@
       body: panel.querySelector('[data-el=body]'),
       cfg: panel.querySelector('[data-el=cfg]'),
       toastEl: panel.querySelector('[data-el=toast]'),
+      settingsOpen: false,
     };
 
     ui.toast = (msg) => {
       ui.toastEl.textContent = msg;
       ui.toastEl.classList.add('on');
       clearTimeout(ui.toastTimer);
-      ui.toastTimer = setTimeout(() => ui.toastEl.classList.remove('on'), 5000);
+      ui.toastTimer = setTimeout(() => ui.toastEl.classList.remove('on'), 6000);
     };
     return ui;
   }
@@ -647,7 +746,19 @@
     const snap = state.snapshot;
     const when = snap && snap.ts ? hhmmss(new Date(snap.ts)) : '—';
     const mins = store.get(KEY.interval, 5);
-    ui.meta.innerHTML = `账户 <b>${(acc && acc.name) || '当前账号'}</b> · 更新于 <b>${when}</b> · 每 ${mins} 分钟自动刷新`;
+    const mode = isTokenMode() ? 'Token 模式' : '会话模式';
+    ui.meta.innerHTML = `账户 <b>${(acc && acc.name) || '当前账号'}</b> · <b>${mode}</b> · 更新于 <b>${when}</b> · 每 ${mins} 分钟刷新`;
+  }
+
+  function bannerHTML(snapshot) {
+    if (!snapshot || !snapshot.authError) return '';
+    const isToken = isTokenMode();
+    const msg = isToken
+      ? 'Token 鉴权失败：请确认令牌有效，且勾选了 <code>Account Analytics : Read</code>（Account 级别权限）。'
+      : '控制台接口拒绝了脚本请求（HTTP 403）。Cloudflare 对 dash 的接口有 CSRF / 风控校验，脚本无法稳定复用 Cookie。<br>请切换到 <b>Token 模式</b>：只需一个只读令牌，1 分钟搞定。';
+    return `<div class="banner"><b>数据采集失败</b><br>${msg}
+      <div class="acts"><button class="btn primary" data-act="${isToken ? 'settings' : 'settings'}">${isToken ? '检查设置' : '去填 Token'}</button>
+      <button class="btn" data-act="diag">查看诊断</button></div></div>`;
   }
 
   function renderBody() {
@@ -656,9 +767,12 @@
     body.innerHTML = '';
 
     if (!state.snapshot) {
-      body.innerHTML = `<div class="empty">还没有数据。<br>点击右上角「刷新」开始读取，<br>或先在「设置」里切换到 API Token 模式。</div>`;
+      body.innerHTML = `<div class="empty">还没有数据。<br>点击右上角「刷新」开始读取。</div>`;
       return;
     }
+
+    const banner = bannerHTML(state.snapshot);
+    if (banner) body.insertAdjacentHTML('beforeend', banner);
 
     for (const sec of SECTIONS) {
       const wrap = document.createElement('div');
@@ -673,46 +787,118 @@
 
     const foot = document.createElement('div');
     foot.className = 'foot';
-    foot.innerHTML = '额度值来自 cloudflare.com/plans 免费套餐。<span class="star">*</span> 为近似口径。点进度条可查看剩余额度。';
+    foot.innerHTML = `额度值来自 cloudflare.com/plans 免费套餐。<span class="star">*</span> 为近似口径。<br>v${VERSION} · <span class="star">*</span> 点进度条可查看剩余额度`;
     body.appendChild(foot);
+  }
+
+  function diagText() {
+    const snap = state.snapshot;
+    if (!snap || !snap.diag || !snap.diag.length) return '暂无错误记录。';
+    const head = [
+      `模式: ${isTokenMode() ? 'token' : 'session'}`,
+      `时间: ${new Date(snap.ts).toISOString()}`,
+      `账户: ${snap.accountId || '-'}`,
+      snap.authError ? `鉴权错误: ${snap.authError}` : null,
+      '',
+    ].filter(Boolean).join('\n');
+    return head + snap.diag.map((d) => `[${d.job}] HTTP ${d.status || '-'} ${d.message}${d.body ? `\n  body: ${d.body}` : ''}`).join('\n');
   }
 
   function renderSettings() {
     if (!ui) return;
     const cfg = ui.cfg;
-    const mode = store.get(KEY.mode, 'session');
+    const mode = isTokenMode() ? 'token' : 'session';
     const token = getToken();
     const interval = store.get(KEY.interval, 5);
+    const snap = state.snapshot;
 
     cfg.innerHTML = `
       <h4>数据来源</h4>
       <select data-f="mode">
-        <option value="session"${mode === 'session' ? ' selected' : ''}>会话模式（复用控制台登录，零配置）</option>
-        <option value="token"${mode === 'token' ? ' selected' : ''}>API Token 模式（只读令牌，更稳定）</option>
+        <option value="token"${mode === 'token' ? ' selected' : ''}>Token 模式（推荐，稳定）</option>
+        <option value="session"${mode === 'session' ? ' selected' : ''}>会话模式（复用控制台登录，可能被 403）</option>
       </select>
-      <h4>API Token（仅 Token 模式使用）</h4>
-      <input type="password" data-f="token" placeholder="粘贴令牌，权限：Account Analytics : Read" value="${token.replace(/"/g, '&quot;')}">
-      <div class="hint">令牌只保存在本机油猴存储中，脚本仅用它请求 api.cloudflare.com，不会发往其他任何地方。会话模式下留空即可。</div>
+      <div class="hint" data-el="modeHint"></div>
+
+      <div data-el="tokenBox">
+        <h4>API Token</h4>
+        <input type="password" data-f="token" placeholder="粘贴令牌（只需 Account Analytics : Read）" value="${token.replace(/"/g, '&quot;')}">
+        <div class="hint">
+          生成地址：控制台 → 我的资料 → API 令牌 → 创建令牌 → 自定义令牌，权限选
+          <code>Account</code> / <code>Account Analytics</code> / <code>Read</code>。
+          令牌仅存于本机油猴存储，只用于请求 <code>api.cloudflare.com</code>。
+        </div>
+      </div>
+
       <h4>自动刷新间隔</h4>
       <select data-f="interval">
         ${[1, 2, 5, 10, 15, 30].map((m) => `<option value="${m}"${Number(interval) === m ? ' selected' : ''}>${m} 分钟</option>`).join('')}
       </select>
+
       <div class="ops">
-        <button class="btn" data-act="save">保存并刷新</button>
-        <button class="btn" data-act="clearcache">清除缓存数据</button>
-      </div>`;
+        <button class="btn primary" data-act="save">保存并刷新</button>
+        <button class="btn" data-act="test">测试连接</button>
+        <button class="btn" data-act="clearcache">清除缓存</button>
+      </div>
+
+      <h4>诊断信息</h4>
+      <div class="diag" data-el="diag"></div>
+      <div class="ops"><button class="btn" data-act="copy">复制诊断</button></div>`;
+
+    const tokenBox = cfg.querySelector('[data-el=tokenBox]');
+    const modeHint = cfg.querySelector('[data-el=modeHint]');
+    const diagEl = cfg.querySelector('[data-el=diag]');
+
+    const syncMode = () => {
+      const m = cfg.querySelector('[data-f=mode]').value;
+      tokenBox.style.display = m === 'token' ? 'block' : 'none';
+      modeHint.innerHTML = m === 'token'
+        ? '用只读令牌直连官方 GraphQL API，不受控制台 CSRF/风控影响，最稳。'
+        : '复用 dash.cloudflare.com 的登录 Cookie。部分账号会被 403 拒绝，届时请改回 Token 模式。';
+    };
+    syncMode();
+    cfg.querySelector('[data-f=mode]').addEventListener('change', syncMode);
+
+    diagEl.textContent = diagText();
 
     cfg.querySelector('[data-act=save]').addEventListener('click', async () => {
       const nextMode = cfg.querySelector('[data-f=mode]').value;
       const nextToken = cfg.querySelector('[data-f=token]').value.trim();
       const nextInterval = Number(cfg.querySelector('[data-f=interval]').value) || 5;
+      if (nextMode === 'token' && !nextToken) {
+        ui.toast('Token 模式需要填写 API Token');
+        return;
+      }
       store.set(KEY.mode, nextMode);
       store.set(KEY.token, nextToken);
       store.set(KEY.interval, nextInterval);
-      ui.toast('设置已保存');
-      state.accounts = [];
       store.set(KEY.accounts, []);
+      state.accounts = [];
+      variantPick.clear();
+      ui.toast('设置已保存，正在刷新…');
+      showSettings(false);
+      scheduleAutoRefresh();
       await refresh(true);
+    });
+
+    cfg.querySelector('[data-act=test]').addEventListener('click', async () => {
+      const m = cfg.querySelector('[data-f=mode]').value;
+      const tk = cfg.querySelector('[data-f=token]').value.trim();
+      store.set(KEY.mode, m);
+      store.set(KEY.token, tk);
+      if (m === 'token' && !tk) { ui.toast('请先填写 Token'); return; }
+      diagEl.textContent = '正在测试…';
+      try {
+        const acc = await resolveAccount();
+        const ctx = buildCtx(acc);
+        const data = await gql(JOBS[0].variants[0].build(ctx));
+        const n = num(gv(account0(data), 'workersInvocationsAdaptive.0.sum.requests'));
+        diagEl.textContent = `✓ 连接成功\n模式: ${m}\n账户: ${acc}\n今日 Workers 请求: ${fmtCount(n)}`;
+        ui.toast('连接成功');
+      } catch (e) {
+        diagEl.textContent = `✗ 连接失败\n模式: ${m}\nHTTP: ${e.status || '-'}\n错误: ${e.message || e}${e.body ? `\nbody: ${clip(e.body, 300)}` : ''}`;
+        ui.toast(`连接失败：${clip(e.message || e, 80)}`);
+      }
     });
 
     cfg.querySelector('[data-act=clearcache]').addEventListener('click', () => {
@@ -720,8 +906,33 @@
       state.snapshot = null;
       renderBody();
       renderMeta();
+      diagEl.textContent = '暂无错误记录。';
       ui.toast('已清除本地缓存');
     });
+
+    cfg.querySelector('[data-act=copy]').addEventListener('click', async () => {
+      const text = diagText();
+      try {
+        if (!navigator.clipboard || !navigator.clipboard.writeText) throw new Error('clipboard unavailable');
+        await navigator.clipboard.writeText(text);
+        ui.toast('诊断信息已复制');
+      } catch (e) {
+        ui.toast('复制失败，请手动选择文本');
+      }
+    });
+  }
+
+  function showSettings(open) {
+    if (!ui) return;
+    ui.settingsOpen = open;
+    ui.cfg.style.display = open ? 'block' : 'none';
+    ui.body.style.display = open ? 'none' : 'block';
+    const btn = ui.panel.querySelector('[data-act=settings]');
+    if (btn) btn.textContent = open ? '返回' : '设置';
+    if (open) {
+      renderSettings();
+      ui.cfg.scrollTop = 0;
+    }
   }
 
   function togglePanel(open) {
@@ -731,11 +942,18 @@
     ui.launcher.style.display = next ? 'none' : 'block';
     store.set(KEY.open, next);
     if (next) {
+      showSettings(false);
       renderMeta();
       renderBody();
       const stale = !state.snapshot || Date.now() - (state.snapshot.ts || 0) > 60_000;
       if (stale && !state.loading) refresh();
     }
+  }
+
+  function accountFromUrl() {
+    const hay = `${location.pathname}${location.hash}`;
+    const m = hay.match(/\/([0-9a-f]{32})(?:\/|$)/i);
+    return m ? m[1] : null;
   }
 
   async function ensureAccounts() {
@@ -750,21 +968,17 @@
     return list;
   }
 
-  function accountFromUrl() {
-    const hay = `${location.pathname}${location.hash}`;
-    const m = hay.match(/\/([0-9a-f]{32})(?:\/|$)/i);
-    return m ? m[1] : null;
-  }
-
   async function resolveAccount() {
-    await ensureAccounts().catch(() => {});
+    // URL 里的 32 位十六进制账户 ID 永远是最可靠来源，先取它
     const fromUrl = accountFromUrl();
     if (fromUrl) {
       state.accountId = fromUrl;
       store.set(KEY.account, fromUrl);
+      ensureAccounts().then(() => renderMeta()).catch(() => {});
       return fromUrl;
     }
-    const saved = store.get(KEY.account, null);
+    await ensureAccounts().catch(() => {});
+    const saved = state.accounts.length ? store.get(KEY.account, null) : null;
     if (saved && state.accounts.some((a) => a.id === saved)) {
       state.accountId = saved;
       return saved;
@@ -774,7 +988,7 @@
       store.set(KEY.account, state.accountId);
       return state.accountId;
     }
-    throw new Error('未找到账户 ID，请在任一账户页面打开面板');
+    throw new Error('未找到账户 ID：请先打开任意一个账户页面（URL 形如 /<账户ID>/…）');
   }
 
   async function refresh(force) {
@@ -789,19 +1003,21 @@
       store.set(KEY.snapshot, snapshot);
       renderMeta();
       renderBody();
+      if (ui.settingsOpen) renderSettings();
 
-      const deadKeys = Object.keys(snapshot.failed || {});
-      if (deadKeys.length) {
-        ui.toast(`${deadKeys.length} 项数据集不可用（悬停灰色项可见原因）`);
+      if (snapshot.authError) {
+        ui.toast(isTokenMode() ? 'Token 鉴权失败，请检查设置' : '会话模式被拒绝（403），请改用 Token 模式');
+      } else {
+        const dead = Object.keys(snapshot.failed || {}).length;
+        if (dead) ui.toast(`${dead} 项数据集不可用（悬停灰色项可见原因）`);
       }
     } catch (e) {
-      const msg = String(e && e.message ? e.message : e);
-      if (ui) ui.toast(`读取失败：${msg}`);
+      const msg = clip(e && e.message ? e.message : e, 160);
+      ui.toast(`读取失败：${msg}`);
       if (!state.snapshot) {
         ui.body.innerHTML = `<div class="empty">读取失败：${msg}<br><br>
-          · 如果提示登录失效，请在控制台重新登录；<br>
-          · 如果 Token 模式报权限错误，令牌需要 <code>Account Analytics : Read</code>；<br>
-          · 也可以在设置里切换数据来源后重试。</div>`;
+          · 建议在「设置」里用 <code>Token 模式</code>（只需 Account Analytics : Read）；<br>
+          · 会话模式如提示 403，是控制台的风控/CSRF 拦截，属预期。</div>`;
       }
     } finally {
       setBusy(false);
@@ -812,7 +1028,7 @@
     clearInterval(state.timer);
     const mins = Number(store.get(KEY.interval, 5)) || 5;
     state.timer = setInterval(() => {
-      if (ui && ui.panel.dataset.hidden === '0') refresh();
+      if (ui && ui.panel.dataset.hidden === '0' && !state.loading) refresh();
     }, Math.max(1, mins) * 60_000);
   }
 
@@ -821,7 +1037,6 @@
     ui.panel.addEventListener('click', (ev) => {
       const t = ev.target.closest('[data-act]');
       if (!t) {
-        // 点击进度条行显示详情
         const row = ev.target.closest('.row');
         if (row && row.title) ui.toast(row.title);
         return;
@@ -829,11 +1044,11 @@
       const act = t.dataset.act;
       if (act === 'close') togglePanel(false);
       if (act === 'refresh') refresh(true);
-      if (act === 'settings') {
-        const show = ui.cfg.style.display === 'none';
-        ui.cfg.style.display = show ? 'block' : 'none';
-        ui.body.style.display = show ? 'none' : 'block';
-        if (show) renderSettings();
+      if (act === 'settings') showSettings(!ui.settingsOpen);
+      if (act === 'diag') {
+        showSettings(true);
+        const el = ui.cfg.querySelector('[data-el=diag]');
+        try { if (el && el.scrollIntoView) el.scrollIntoView({ block: 'center' }); } catch (e) { /* 忽略 */ }
       }
     });
 
@@ -861,9 +1076,9 @@
     if (open) refresh();
   }
 
-  // 调试/测试接口（在控制台输入 __CFU__ 即可查看内部能力）
+  // 调试/测试接口（控制台输入 __CFU__ 即可查看内部能力）
   try {
-    globalThis.__CFU__ = { JOBS, LIMITS, SPECS, SECTIONS, buildCtx, collect, runJob, gql, fmt, fmtCount, fmtBytes, r2Class, store };
+    globalThis.__CFU__ = { JOBS, LIMITS, SPECS, SECTIONS, buildCtx, collect, runJob, gql, fmt, fmtCount, fmtBytes, r2Class, store, variantPick };
   } catch (e) { /* 忽略 */ }
 
   // 非浏览器环境（单元测试）只导出接口，不挂载 UI

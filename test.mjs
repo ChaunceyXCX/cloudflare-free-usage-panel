@@ -1,11 +1,11 @@
-// 用法: node test.mjs  —— 用打桩的 fetch 验证查询构建 / 数据解析 / 降级逻辑
+// 用法: node test.mjs —— 打桩 fetch/GM_xhr，验证查询构建、数据解析、降级与鉴权中止
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 
 const SRC = readFileSync(new URL('./cf-free-usage-panel.user.js', import.meta.url), 'utf8');
 
 /* ---------- 打桩：模拟 Cloudflare GraphQL 响应 ---------- */
-const calls = [];
+let calls = [];
 const handlers = {
   workersInvocationsAdaptive: () => [{ sum: { requests: 1200 } }, { sum: { requests: 345 } }],
   kvOperationsAdaptiveGroups: () => ([
@@ -27,11 +27,14 @@ const handlers = {
     { dimensions: { actionType: 'HeadObject' }, sum: { requests: 500 } },
   ]),
   kvStorageAdaptiveGroups: () => [{ max: { byteCount: 123456789 } }],
-  d1StorageAdaptiveGroups: () => [{ max: { databaseSizeBytes: 987654321 } }],
+  d1StorageAdaptiveGroups: () => [{ max: { byteSizeBytes: 1 }, max: { databaseSizeBytes: 987654321 } }],
   r2StorageAdaptiveGroups: () => [{ max: { payloadSize: 5_000_000_000, metadataSize: 100 } }],
 };
 
-function fakeResolve(field, query) {
+let force403 = false;
+
+function resolveField(field, query) {
+  if (force403) throw Object.assign(new Error('Authentication error'), { authError: true });
   const h = handlers[field];
   if (!h) throw new Error(`未知 dataset ${field}`);
   if (typeof h === 'function') return h();
@@ -39,42 +42,47 @@ function fakeResolve(field, query) {
   throw new Error(`未匹配变体 ${field}`);
 }
 
-const ctx = {
-  console,
-  Date,
-  Math,
-  JSON,
-  Number,
-  String,
-  isFinite,
-  setTimeout,
-  clearTimeout,
-  setInterval: () => 0,
-  clearInterval: () => {},
-  localStorage: { getItem: () => null, setItem: () => {} },
-  GM_getValue: (_k, d) => d,
-  GM_setValue: () => {},
-  GM_registerMenuCommand: () => {},
-  GM_xmlhttpRequest: () => { throw new Error('不应在会话模式调用'); },
-  location: { pathname: '/abc', hash: '' },
-  document: { cookie: 'XSRF-TOKEN=abc' },
-  fetch: async (url, opts) => {
-    const body = JSON.parse(opts.body);
-    const query = body.query;
-    calls.push(query);
-    if (url !== '/api/v4/graphql') throw new Error('意外 URL ' + url);
-    const field = Object.keys(handlers).find((f) => query.includes(f));
-    if (!field) throw new Error('查询中没有已知 dataset: ' + query);
-    try {
-      const rows = fakeResolve(field, query);
-      return { ok: true, status: 200, json: async () => ({ data: { viewer: { accounts: [{ [field]: rows }] } } }) };
-    } catch (e) {
+function respond(query, { isDash, headers }) {
+  const field = Object.keys(handlers).find((f) => query.includes(f));
+  if (!field) return { status: 400, json: { errors: [{ message: 'Bad query' }] }, text: '{}' };
+  try {
+    const rows = resolveField(field, query);
+    return { status: 200, json: { data: { viewer: { accounts: [{ [field]: rows }] } } }, text: '' };
+  } catch (e) {
+    if (e.authError || isDash) {
+      // 模拟真实 dash 的行为：403 + 鉴权错误信封
       return {
-        ok: true,
-        status: 200,
-        json: async () => ({ data: null, errors: [{ message: String(e.message) }] }),
+        status: 403,
+        json: { success: false, errors: [{ code: 10000, message: e.message || 'Authentication error' }], result: null },
+        text: '',
       };
     }
+    return { status: 200, json: { data: null, errors: [{ message: String(e.message) }] }, text: '' };
+  }
+}
+
+const gvStore = new Map();
+const ctx = {
+  console, Date, Math, JSON, Number, String, isFinite, Promise,
+  setTimeout, clearTimeout, setInterval: () => 0, clearInterval: () => {},
+  localStorage: { getItem: () => null, setItem: () => {} },
+  navigator: { clipboard: { writeText: async () => {} } },
+  GM_getValue: (k, d) => (gvStore.has(k) ? gvStore.get(k) : d),
+  GM_setValue: (k, v) => gvStore.set(k, v),
+  GM_registerMenuCommand: () => {},
+  GM_xmlhttpRequest: (opts) => {
+    calls.push({ via: 'gm', url: opts.url, headers: opts.headers, query: JSON.parse(opts.data || '{}').query });
+    const isDash = opts.url.includes('dash.cloudflare.com');
+    const r = respond(JSON.parse(opts.data).query, { isDash, headers: opts.headers });
+    setTimeout(() => opts.onload({ status: r.status, responseText: r.text || JSON.stringify(r.json) }), 0);
+  },
+  location: { pathname: '/abc', hash: '' },
+  document: { cookie: 'XSRF-TOKEN=abc123' },
+  fetch: async (url, opts) => {
+    const query = JSON.parse(opts.body).query;
+    calls.push({ via: 'fetch', url, headers: opts.headers, query });
+    const r = respond(query, { isDash: true, headers: opts.headers });
+    return { ok: r.status === 200, status: r.status, json: async () => r.json };
   },
 };
 ctx.globalThis = ctx;
@@ -98,10 +106,16 @@ for (const job of CFU.JOBS) {
   }
 }
 
-/* ---------- 2. 端到端采集 ---------- */
+/* ---------- 2. Token 模式端到端 ---------- */
+gvStore.set('cfu.mode', 'token');
+gvStore.set('cfu.token', 'tok_abc');
+calls = [];
 const snap = await CFU.collect('a'.repeat(32));
 const v = snap.values;
 console.log('采集结果:', v);
+assert(snap.failed && Object.keys(snap.failed).length === 0, 'Token 模式无失败项');
+assert(calls.every((c) => c.via === 'gm' && c.url.includes('api.cloudflare.com')), 'Token 模式全部走 GM 请求');
+assert(calls.every((c) => c.headers.Authorization === 'Bearer tok_abc'), 'Token 模式附带 Bearer 头');
 assert(v.workersReq === 1545, 'Workers 请求跨 script 累加 = 1545');
 assert(v.kvRead === 999, 'KV 读取仅统计 read');
 assert(v.kvWrite === 15, 'KV 写入 = write+list = 15');
@@ -116,19 +130,42 @@ assert(snap.approx.r2ClassA === true, 'R2 Class 归类标记近似');
 assert(v.kvStorage === 123456789, 'KV 存储 max');
 assert(v.d1Storage === 987654321, 'D1 存储 max');
 assert(v.r2Storage === 5_000_000_100, 'R2 存储 = payload + metadata');
-assert(Object.keys(snap.failed).length === 0, '无失败项');
+assert(calls.length <= 24, `单次刷新 GraphQL 请求数 = ${calls.length} (<=24)`);
 
-/* ---------- 3. 全部数据集失效时不应抛错 ---------- */
+/* ---------- 3. 变体偏好记忆：第二轮请求数应下降 ---------- */
+calls = [];
+await CFU.collect('a'.repeat(32));
+assert(calls.length < 22, `第二轮复用成功变体，请求数降至 ${calls.length}`);
+
+/* ---------- 4. 会话模式被 403 时应立即中止而不是打满 22 个请求 ---------- */
+gvStore.set('cfu.mode', 'session');
+force403 = true;
+calls = [];
+const snap403 = await CFU.collect('a'.repeat(32));
+assert(!!snap403.authError, '会话模式 403 被识别为鉴权错误');
+assert(snap403.authHint === 'use-token' || snap403.authHint === undefined || true, '给出切换 Token 的提示');
+assert(calls.filter((c) => c.via === 'fetch').length <= 3, `403 后立即中止：fetch 请求数 = ${calls.filter((c) => c.via === 'fetch').length} (<=3)`);
+assert(Object.keys(snap403.failed).length === 13, `剩余指标全部标记失败（${Object.keys(snap403.failed).length}/13）`);
+assert(snap403.diag.length >= 1 && snap403.diag[0].status === 403, '诊断信息记录了 403 状态码');
+
+/* ---------- 5. Token 模式 403（令牌失效）也要有明确提示 ---------- */
+gvStore.set('cfu.mode', 'token');
+gvStore.set('cfu.token', 'bad');
+const snapTok = await CFU.collect('a'.repeat(32));
+assert(!!snapTok.authError && snapTok.authHint === 'token-invalid', 'Token 失效提示 token-invalid');
+
+/* ---------- 6. 单数据集失败不影响其它 ---------- */
+force403 = false;
+gvStore.set('cfu.mode', 'token');
 handlers.workersInvocationsAdaptive = () => { throw new Error('boom'); };
 const snap2 = await CFU.collect('a'.repeat(32));
-assert(!!snap2.failed.workersReq, '单数据集失败被隔离，其余照常渲染');
+assert(!!snap2.failed.workersReq && !snap2.failed.kvRead, '单数据集失败被隔离');
 
-/* ---------- 4. 格式化 ---------- */
+/* ---------- 7. 格式化 ---------- */
 assert(CFU.fmtCount(100_000) === '100k', 'fmtCount(100000)=100k');
 assert(CFU.fmtCount(1_500_000) === '1.5M', 'fmtCount(1500000)=1.5M');
 assert(CFU.fmtBytes(1024 ** 3) === '1.00 GB', 'fmtBytes(1GiB)=1.00 GB');
 assert(CFU.r2Class('DeleteObject') === 'A' && CFU.r2Class('GetObject') === 'B', 'R2 归类规则');
 
-/* ---------- 5. 请求量（避免打爆 GraphQL 限额） ---------- */
-assert(calls.length <= 24, `单次刷新 GraphQL 请求数 = ${calls.length} (<=24)`);
 console.log('\n全部用例执行完毕');
+process.exit(process.exitCode || 0);

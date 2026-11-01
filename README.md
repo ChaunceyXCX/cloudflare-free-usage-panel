@@ -34,13 +34,17 @@
 
 面板读取的是控制台图表背后的 **GraphQL Analytics API**（账号级 dataset），不抓 HTML、不截图、不经过任何第三方服务器。
 
-- **会话模式（默认，零配置）**：复用当前浏览器已登录的控制台 Cookie，POST `https://dash.cloudflare.com/api/v4/graphql`（同源 + `XSRF-TOKEN` → `X-CSRF-Token`）。
-- **API Token 模式**：在「设置」里粘贴一个只读令牌，权限只需 `Account Analytics : Read`。脚本用 `GM_xmlhttpRequest` 直连 `api.cloudflare.com`（绕过页面 CSP），令牌仅保存在本机油猴存储。
+- **Token 模式（默认，推荐）**：在「设置」里粘贴一个只读令牌，权限只需 `Account Analytics : Read`。脚本用 `GM_xmlhttpRequest` 直连 `api.cloudflare.com`（绕过页面 CSP），令牌仅保存在本机油猴存储。
+  生成路径：控制台右上角头像 → 我的资料 → API 令牌 → 创建令牌 → 自定义令牌 → 权限选 `Account` / `Account Analytics` / `Read` → 作用范围选你的账号（或 All accounts）。
+- **会话模式（零配置，可能 403）**：复用当前浏览器已登录的控制台 Cookie，POST `https://dash.cloudflare.com/api/v4/graphql`（同源 + `XSRF-TOKEN` → `X-CSRF-Token`）。
+  Cloudflare 对 dash 接口有 CSRF 与风控校验，**多数账号下脚本请求会被 403 拒绝**，这是预期结果，不是脚本 bug —— 面板会直接弹出横幅引导切到 Token 模式，并且立刻中止后续请求（不刷屏）。
 
 ## 设计要点
 
-- **每个 dataset 独立容错**：并行采集（每次刷新约 22 个 GraphQL 请求，按 3 个一批），单个数据集报错只影响自己那行，显示灰色「不可用」并 `title` 提示原因。
-- **多套查询变体自动降级**：字段名在不同账号 schema 上略有差异（例如 D1 的 `rowsRead`、Workers AI 的 `totalNeurons`），前一变体失败自动换下一个，降级口径会带 `*` 标记为近似值。
+- **每个 dataset 独立容错**：并行采集（每次刷新 11 个 GraphQL 请求，按 3 个一批），单个数据集报错只影响自己那行，显示灰色「不可用」并 `title` 提示原因。
+- **鉴权失败快速中止**：识别到 401/403 立刻停掉剩余请求，并在面板顶部显示原因 + 「去填 Token」按钮。
+- **诊断区**：设置页底部汇总每次失败的任务、HTTP 状态与响应片段，可一键复制。
+- **多套查询变体自动降级**：字段名在不同账号 schema 上略有差异（例如 D1 的 `rowsRead`、Workers AI 的 `totalNeurons`），前一变体失败自动换下一个，成功的变体被记住，下一轮直接用它（请求数从 11 降到 10）。降级口径会带 `*` 标记为近似值。
 - **进度条视觉分档**：< 70% 绿色 / ≥ 70% 琥珀色 / ≥ 90% 红色并呼吸闪烁；超额度时进度条裁剪在 100% 但百分比照实显示 104% 这类数字。
 - **本地快照**：结果缓存到油猴存储，重开页面秒开显示上次数据，并标注更新时间。
 - **自动刷新**：默认 5 分钟（设置里 1–30 分钟），面板收起时不发请求。
@@ -51,7 +55,7 @@
 - 存储类指标取的是「近期峰值占用」（KV/D1 取近 2 天 `max`，R2 取近 24 小时 `max(payloadSize+metadataSize)`），与控制台按平均值展示的 GB-month 口径略有差异。
 - R2 Class A/B 是本地按 `actionType` 归类的近似结果（`Put/List/Copy/Delete/Create/Upload` → A，`Get/Head` → B），带 `*`。
 - Pages 构建次数、Images 转换次数、Vectorize 维度等目前**没有稳定的账号级 GraphQL dataset**，未纳入面板。
-- 会话模式依赖控制台 Cookie；如果你的账号强制 SSO 或脚本运行在受限环境，改用 Token 模式。
+- 会话模式会被控制台风控拦（403）时，只能改用 Token 模式；脚本无法绕过 Cloudflare 的 CSRF/风控策略，也不打算绕。
 
 ## 开发 / 测试
 
