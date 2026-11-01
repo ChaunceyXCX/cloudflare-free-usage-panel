@@ -45,6 +45,7 @@ const { window } = dom;
 
 const store = new Map();
 store.set('cfu.mode', 'session');
+store.set('cfu.lang', 'zh'); // jsdom 默认 en-US，这里固定中文以便断言文案
 window.GM_getValue = (k, d) => (store.has(k) ? store.get(k) : d);
 window.GM_setValue = (k, v) => store.set(k, v);
 window.GM_registerMenuCommand = () => {};
@@ -117,6 +118,34 @@ settingsBtn.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
 assert(settingsBtn.textContent === '设置', '返回后按钮文案恢复为「设置」');
 assert(root.querySelector('[data-el=body]').style.display === 'block', '返回后用量列表恢复显示');
 
+
+
+// ---- 方案 A：star 引导（不拦人，可永久关闭）----
+assert(!!root.querySelector('.star'), '首屏出现一次性 star 引导卡片');
+assert(/github\.com/.test(root.querySelector('.foot a').getAttribute('href')), '页脚挂了 GitHub 仓库链接');
+root.querySelector('[data-act=star-later]').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+assert(!root.querySelector('.star'), '点「以后再说」后消失');
+assert(store.get('cfu.starPromptDone') === true, 'star 引导状态已持久化（cfu.starPromptDone），不再打扰');
+
+// ---- 中英切换 ----
+const labelOf = (k) => root.querySelector(`.row[data-key="${k}"] .name`).textContent.replace(/\s+/g, ' ').trim();
+assert(labelOf('workersReq') === 'Workers 请求', `默认中文标签（${labelOf('workersReq')}）`);
+root.querySelector('[data-act=settings]').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+const langSel = root.querySelector('[data-f=lang]');
+assert(!!langSel, '设置里存在语言选择器');
+langSel.value = 'en';
+langSel.dispatchEvent(new window.Event('change', { bubbles: true }));
+assert(root.querySelector('[data-el=title]').textContent === 'Free tier usage', '标题切到英文');
+assert(labelOf('workersReq') === 'Workers requests', `指标名切到英文（${labelOf('workersReq')}）`);
+assert(/Daily quota/.test(root.querySelector('.sec-h').textContent), '分区标题切到英文');
+assert(/GraphQL requests this round/.test(root.querySelector('.foot').textContent), '页脚切到英文');
+assert(store.get('cfu.lang') === 'en', '语言选择已持久化');
+assert(root.querySelector('[data-act=save]').textContent === 'Save & refresh', '设置按钮文案切英文');
+// 切回中文
+root.querySelector('[data-f=lang]').value = 'zh';
+root.querySelector('[data-f=lang]').dispatchEvent(new window.Event('change', { bubbles: true }));
+assert(labelOf('workersReq') === 'Workers 请求', '切回中文生效');
+root.querySelector('[data-act=settings]').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
 
 // ---- 拖拽：悬浮球 ----
 const pointer = (el, type, x, y) => el.dispatchEvent(new window.MouseEvent(type, { clientX: x, clientY: y, bubbles: true }));

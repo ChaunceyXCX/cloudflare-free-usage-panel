@@ -1,8 +1,8 @@
 {
   "name": "cloudflare-free-usage-panel",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "private": true,
-  "description": "Tampermonkey 脚本：在 Cloudflare 控制台用进度条查看免费账号各资源使用量",
+  "description": "Tampermonkey 脚本：在 Cloudflare 控制台用进度条查看免费账号各资源使用量（中/英双语）",
   "main": "cf-free-usage-panel.user.js",
   "type": "commonjs",
   "scripts": {
@@ -11,9 +11,24 @@
     "test:dom": "node test-dom.mjs",
     "test:all": "node --check cf-free-usage-panel.user.js && node test.mjs && node test-dom.mjs"
   },
-  "keywords": ["cloudflare", "userscript", "tampermonkey", "graphql", "quota"],
+  "keywords": [
+    "cloudflare",
+    "userscript",
+    "tampermonkey",
+    "graphql",
+    "quota"
+  ],
   "license": "MIT",
   "devDependencies": {
     "jsdom": "^30.1.3"
-  }
+  },
+  "homepage": "https://github.com/ChaunceyXCX/cloudflare-free-usage-panel#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ChaunceyXCX/cloudflare-free-usage-panel.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ChaunceyXCX/cloudflare-free-usage-panel/issues"
+  },
+  "author": "chauncey"
 }
