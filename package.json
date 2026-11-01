@@ -1,13 +1,18 @@
 {
-  "name": "cf-free-usage",
-  "version": "1.0.0",
-  "description": "",
+  "name": "cloudflare-free-usage-panel",
+  "version": "1.3.0",
+  "private": true,
+  "description": "Tampermonkey 脚本：在 Cloudflare 控制台用进度条查看免费账号各资源使用量",
   "main": "cf-free-usage-panel.user.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "keywords": [],
   "type": "commonjs",
+  "scripts": {
+    "lint": "node --check cf-free-usage-panel.user.js",
+    "test": "node test.mjs",
+    "test:dom": "node test-dom.mjs",
+    "test:all": "node --check cf-free-usage-panel.user.js && node test.mjs && node test-dom.mjs"
+  },
+  "keywords": ["cloudflare", "userscript", "tampermonkey", "graphql", "quota"],
+  "license": "MIT",
   "devDependencies": {
     "jsdom": "^30.1.3"
   }
