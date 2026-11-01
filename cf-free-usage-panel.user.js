@@ -943,8 +943,11 @@
     .btn:disabled { opacity: .55; cursor: default; }
     .btn.primary { background: #f6821f; border-color: #f6821f; color: #1a1207; font-weight: 650; }
     .btn.primary:hover { background: #ff9330; border-color: #ff9330; }
-    .meta { padding: 8px 14px; font-size: 11.5px; color: #8b93a3; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+    .meta { padding: 8px 14px; font-size: 11.5px; color: #8b93a3; display: flex; flex-direction: column; gap: 2px; }
     .meta b { color: #b9c0cd; font-weight: 600; }
+    .meta .ml { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 6px; }
+    .meta .seg { display: inline-flex; gap: 6px; align-items: baseline; white-space: nowrap; }
+    .meta .sep { font-style: normal; color: #4d5461; }
     .meta .stale { color: #f0c08a; }
     .body { padding: 4px 14px 14px; overflow-y: auto; }
     .body::-webkit-scrollbar, .cfg::-webkit-scrollbar, .diag::-webkit-scrollbar { width: 8px; }
@@ -1251,11 +1254,16 @@
     const when = snap && snap.ts ? hhmmss(new Date(snap.ts)) : '—';
     const mins = store.get(KEY.interval, 5);
     const mode = isTokenMode() ? t('mode.token') : t('mode.session');
-    const stale = state.staleNotice
-      ? ` · <span class="stale">${t('meta.stale', { time: state.staleNotice })}</span>`
-      : '';
-    ui.meta.innerHTML = `${t('meta.account')} <b>${(acc && acc.name) || '—'}</b> · <b>${mode}</b> · `
-      + `${t('meta.updated')} <b>${when}</b> · ${t('meta.every', { n: mins })}${stale}`;
+    // 分两行排版：账户/模式 · 更新于/间隔，段间用 inline-flex 包裹，换行不会把「·」甩到行首
+    const line = (segs) => `<div class="ml">${segs
+      .map((s, i) => `<span class="seg">${i ? '<i class="sep">·</i>' : ''}${s}</span>`)
+      .join('')}</div>`;
+    const row1 = [`${t('meta.account')} <b>${(acc && acc.name) || '—'}</b>`, `<b>${mode}</b>`];
+    const row2 = [`${t('meta.updated')} <b>${when}</b>`, t('meta.every', { n: mins })];
+    if (state.staleNotice) {
+      row2.push(`<span class="stale">${t('meta.stale', { time: state.staleNotice })}</span>`);
+    }
+    ui.meta.innerHTML = line(row1) + line(row2);
   }
 
   function renderBody() {

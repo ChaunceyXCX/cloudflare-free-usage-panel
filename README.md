@@ -11,13 +11,30 @@ English → [README.en.md](README.en.md)
 
 在 `dash.cloudflare.com` 右下角挂一个橙色「CF」悬浮球，点开就是一张用量看板：13 项指标、进度条分档配色、超额度红色呼吸。**零配置**（复用控制台登录），也可以换成只读 API Token。界面支持**中文 / English** 即时切换。
 
-<!-- 想放截图：把面板截图存成 docs/preview.png，然后取消下面这行注释 -->
-<!-- ![preview](docs/preview.png) -->
+---
+
+## 界面
+
+<p align="center">
+  <img src="docs/preview/panel-zh.png" width="340" alt="面板（简体中文）">
+  &nbsp;&nbsp;
+  <img src="docs/preview/panel-en.png" width="340" alt="Panel (English)">
+</p>
+
+<p align="center"><sub>左：简体中文 · 右：English（截图为<b>演示数据</b>，真实账号会显示你自己的账户名）</sub></p>
+
+<details>
+<summary>设置页 / Settings（语言、数据来源、刷新间隔、诊断信息）</summary>
+
+<p align="center"><img src="docs/preview/panel-settings.png" width="340" alt="设置页"></p>
+
+</details>
 
 ---
 
 ## 目录
 
+- [界面](#界面)
 - [功能](#功能)
 - [监控的指标与免费额度](#监控的指标与免费额度)
 - [安装](#安装)
@@ -147,6 +164,7 @@ npm run lint         # node --check 语法检查
 npm test             # 采集层单测（打桩 fetch，84+ 断言）
 npm run test:dom     # jsdom UI 冒烟测试（渲染 / 拖拽 / i18n / 403 / 快照保护）
 npm run test:all     # 全量
+npm run screenshot   # 用本机 Chrome 无头重跑 docs/preview/ 里的界面截图（演示数据）
 ```
 
 浏览器控制台里 `__CFU__` 暴露了 `JOBS / GROUPS / LIMITS / buildCtx / collect / gql / t / setLang` 等调试接口。
@@ -157,6 +175,8 @@ npm run test:all     # 全量
 cf-free-usage-panel.user.js   # 脚本本体（单文件，无依赖）
 test.mjs                      # 采集层单测
 test-dom.mjs                  # UI 冒烟测试
+tools/screenshot.mjs          # 生成 README 截图（playwright-core + 本机 Chrome）
+docs/preview/                 # 截图与打赏页
 assets/donate/                # 打赏二维码
 ```
 

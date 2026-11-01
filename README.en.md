@@ -11,13 +11,30 @@
 
 An orange “CF” bubble sits in the bottom-right corner of `dash.cloudflare.com`. Click it and you get a usage board: 13 metrics, colour-coded progress bars, red pulsing bars once you pass the quota. **Zero configuration** by default (it reuses your dashboard session), or plug in a read-only API token instead. UI is available in **English / 简体中文**, switchable instantly.
 
-<!-- Add a screenshot: save one as docs/preview.png and uncomment the line below -->
-<!-- ![preview](docs/preview.png) -->
+---
+
+## Screenshots
+
+<p align="center">
+  <img src="docs/preview/panel-zh.png" width="340" alt="Panel (Simplified Chinese)">
+  &nbsp;&nbsp;
+  <img src="docs/preview/panel-en.png" width="340" alt="Panel (English)">
+</p>
+
+<p align="center"><sub>Left: 简体中文 · Right: English (screenshots use <b>demo data</b>; your own account name is shown in real use)</sub></p>
+
+<details>
+<summary>Settings / 设置（language, data source, interval, diagnostics）</summary>
+
+<p align="center"><img src="docs/preview/panel-settings.png" width="340" alt="Settings panel"></p>
+
+</details>
 
 ---
 
 ## Contents
 
+- [Screenshots](#screenshots)
 - [Features](#features)
 - [Metrics and quotas](#metrics-and-quotas)
 - [Install](#install)
@@ -143,6 +160,7 @@ npm run lint         # node --check
 npm test             # collection-layer unit tests (stubbed fetch, 84+ assertions)
 npm run test:dom     # jsdom UI smoke test (render / drag / i18n / 403 / snapshot protection)
 npm run test:all     # everything
+npm run screenshot   # regenerate docs/preview/ screenshots with headless Chrome (demo data)
 ```
 
 `__CFU__` is exposed in the page console with `JOBS / GROUPS / LIMITS / buildCtx / collect / gql / t / setLang`.
@@ -151,6 +169,8 @@ npm run test:all     # everything
 cf-free-usage-panel.user.js   # the userscript (single file, no deps)
 test.mjs                      # collection tests
 test-dom.mjs                  # UI smoke tests
+tools/screenshot.mjs          # README screenshot generator (playwright-core + local Chrome)
+docs/preview/                 # screenshots + donate page
 assets/donate/                # donation QR codes
 ```
 
