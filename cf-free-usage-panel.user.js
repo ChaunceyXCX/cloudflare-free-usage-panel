@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cloudflare 免费额度用量面板
 // @namespace    https://dash.cloudflare.com/cf-free-usage
-// @version      1.1.0
+// @version      1.2.0
 // @description  在 Cloudflare 控制台里用进度条直观查看 Workers / KV / D1 / R2 / Queues / DO / Workers AI 等免费额度的实时使用量
 // @author       chauncey
 // @match        https://dash.cloudflare.com/*
@@ -20,12 +20,13 @@
  * 数据来源是 Cloudflare 官方的 GraphQL Analytics API（账号级 dataset），
  * 也就是控制台图表背后的同一套接口。两种取数模式：
  *
- *   1) Token 模式（推荐 / 稳定）：粘贴一个只读 API Token（Account Analytics : Read），
- *      脚本用 GM_xmlhttpRequest 直连 https://api.cloudflare.com/client/v4/graphql。
- *      令牌只存在本机油猴存储，不经手任何第三方。
- *   2) 会话模式（零配置，视账号而定）：复用 dash.cloudflare.com 的登录 Cookie，
- *      POST /api/v4/graphql。控制台对脚本发起的写/查请求有 CSRF 与风控校验，
- *      部分账号会被 403 拒绝 —— 此时面板会直接提示切换 Token 模式，而不是静默变空。
+ *   1) 会话模式（默认，零配置）：复用 dash.cloudflare.com 的登录 Cookie，同源 POST
+ *      /api/v4/graphql。为降低被风控/限流拦下的概率：
+ *        · 把 10 个 dataset 合并成 2 个 GraphQL 文档（用 alias 一次问一组）；
+ *        · 遇到 403 只做一次 700ms 退避重试，绝不用扩展请求（GM 请求必被 WAF 挡）；
+ *        · 合并失败才退化为逐项查询，并在两次之间留 180ms 间隔。
+ *   2) Token 模式：粘贴只读 API Token（Account Analytics : Read），用 GM_xmlhttpRequest
+ *      直连 https://api.cloudflare.com/client/v4/graphql。令牌只存本机油猴存储。
  *
  * 免费额度数值来自 https://www.cloudflare.com/plans 的 Free Tier Summary，
  * 若官方调整额度，改下面 LIMITS 即可。
@@ -35,7 +36,8 @@
   'use strict';
 
   const GB = 1024 ** 3;
-  const VERSION = '1.1.0';
+  const VERSION = '1.2.0';
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   /* =========================================================================
    * 1. 免费额度配置（来源：cloudflare.com/plans - Free Tier Summary）
@@ -84,7 +86,7 @@
   const KEY = {
     mode: 'cfu.mode', token: 'cfu.token', account: 'cfu.account',
     accounts: 'cfu.accounts', snapshot: 'cfu.snapshot', open: 'cfu.open',
-    interval: 'cfu.interval',
+    interval: 'cfu.interval', variants: 'cfu.variants',
   };
 
   const store = {
@@ -103,9 +105,9 @@
     },
   };
 
-  const gv = (o, path) => path.split('.').reduce((a, k) => (a == null ? a : a[k]), o);
+  const gq = (o, path) => path.split('.').reduce((a, k) => (a == null ? a : a[k]), o);
   const num = (v) => (typeof v === 'number' ? v : Number(v) || 0);
-  const sumOf = (rows, path) => (rows || []).reduce((a, r) => a + num(gv(r, path)), 0);
+  const sumOf = (rows, path) => (rows || []).reduce((a, r) => a + num(gq(r, path)), 0);
   const account0 = (data) => data?.viewer?.accounts?.[0] || {};
 
   const isoDT = (d) => d.toISOString().replace(/\.\d{3}Z$/, 'Z');
@@ -134,8 +136,10 @@
   const fmt = (kind, n) => (kind === 'bytes' ? fmtBytes(n) : fmtCount(n));
 
   /* =========================================================================
-   * 3. GraphQL 传输层（Token / 会话 Cookie 双模式 + 详细错误信息）
+   * 3. GraphQL 传输层
    * ========================================================================= */
+  let httpCount = 0; // 每次真正发出的 HTTP 请求（含重试）
+
   class GQLError extends Error {
     constructor(message, info) {
       super(message);
@@ -143,12 +147,15 @@
       this.status = info?.status || 0;
       this.body = info?.body || '';
       this.hint = info?.hint || '';
-      this.authError = !!(this.status === 401 || this.status === 403)
-        || /authentication error|unauthorized|not authorized|session has expired|invalid (api )?token|permission|权限|登录/i.test(message);
+      // 只有「令牌/登录态」类错误才是真鉴权失败；dash 的 403 多为风控/限流
+      this.authError = this.status === 401
+        || /invalid (api )?token|unauthorized|authentication error|permission|权限/i.test(message);
+      this.throttled = this.status === 403;
     }
   }
 
-  const isTokenMode = () => store.get(KEY.mode, 'token') === 'token';
+  // 默认会话模式：零配置，控制台登录即可用；持续 403 时面板会引导切 Token
+  const isTokenMode = () => store.get(KEY.mode, 'session') === 'token';
   const getToken = () => String(store.get(KEY.token, '') || '').trim();
 
   function csrfToken() {
@@ -175,26 +182,24 @@
     });
   }
 
-  function unwrapGraphQL(body, info) {
-    if (!body) throw new GQLError(`响应不是 JSON（HTTP ${info.status}）：${clip(info.body)}`, info);
-    // dash 的 REST 信封 { success, errors, result } 与标准 { data, errors } 都兼容
-    const env = body.data && typeof body.data === 'object'
-      ? body
-      : (body.result && body.result.data ? body.result : null);
+  // 统一解析：返回 { data, errors }，仅当整体不可用时抛错
+  function parseGraphQL(body, info) {
+    if (!body) throw new GQLError(`响应不是 JSON（HTTP ${info.status}）`, info);
+    const env = body.data !== undefined ? body : (body.result && body.result.data !== undefined ? body.result : null);
     if (!env) {
       const e = (body.errors && body.errors[0]) || null;
-      const msg = (e && (e.message || e.code)) || body.message || '未知错误';
+      const msg = (e && (e.message || e.code)) || body.message || `HTTP ${info.status}`;
       throw new GQLError(String(msg), info);
     }
-    if (env.errors && env.errors.length) {
-      throw new GQLError(String(env.errors[0].message || '数据集不可用'), info);
+    if (env.data == null) {
+      const msg = (env.errors && env.errors[0] && env.errors[0].message) || '数据集不可用';
+      throw new GQLError(String(msg), info);
     }
-    if (!env.data) throw new GQLError('响应缺少 data 字段', info);
-    return env.data;
+    return { data: env.data, errors: env.errors || [] };
   }
 
-  // Token 模式：GM_xmlhttpRequest 直连官方 API，绕开页面 CSP
-  async function gqlViaToken(query) {
+  async function requestToken(query) {
+    httpCount += 1;
     const token = getToken();
     if (!token) throw new GQLError('未配置 API Token，请到「设置」填入', { hint: 'token-empty' });
     const res = await gmRequest({
@@ -208,59 +213,58 @@
     if (res.status === 401 || res.status === 403) {
       throw new GQLError('Token 无效或权限不足（需要 Account Analytics : Read）', info);
     }
-    return unwrapGraphQL(res.json, info);
+    return parseGraphQL(res.json, info);
   }
 
-  // 会话模式：同源 fetch 复用 Cookie；失败时再退一步用 GM 请求（不带页面 fetch 特征）
-  async function gqlViaSession(query) {
+  /*
+   * 会话模式只走同源 fetch：
+   * 扩展发起的请求（GM_xhr）会被控制台 WAF 一律判 403，重试只是徒增一片控制台报错，
+   * 所以只在 fetch 抛网络异常（CSP/离线）时才退到 GM。
+   */
+  async function requestSession(query) {
     const csrf = csrfToken();
-    const baseHeaders = { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf, 'X-XSRF-Token': csrf };
-    let firstErr = null;
-
+    const headers = { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf, 'X-XSRF-Token': csrf };
+    let res;
+    httpCount += 1;
     try {
-      const res = await fetch('/api/v4/graphql', {
+      res = await fetch('/api/v4/graphql', {
         method: 'POST',
         credentials: 'same-origin',
-        headers: baseHeaders,
+        headers,
         body: JSON.stringify({ query }),
       });
-      let json = null;
-      try { json = await res.json(); } catch (e) { /* 非 JSON */ }
-      if (res.status === 200 || json) {
-        const info = { status: res.status, body: json ? JSON.stringify(json) : '' };
-        return unwrapGraphQL(json, info);
-      }
-      firstErr = new GQLError(`HTTP ${res.status}`, { status: res.status });
     } catch (e) {
-      firstErr = e instanceof GQLError ? e : new GQLError(`请求失败：${e.message}`);
-    }
-
-    // 回退：用扩展发起的请求（Cookie 同样附带，但不是页面 fetch 指纹）
-    try {
-      const res = await gmRequest({
+      // 页面上下文请求发不出去（CSP/网络层），退到扩展请求再试一次
+      httpCount += 1;
+      const r2 = await gmRequest({
         method: 'POST',
         url: 'https://dash.cloudflare.com/api/v4/graphql',
-        headers: baseHeaders,
+        headers,
         data: JSON.stringify({ query }),
         timeout: 20000,
       });
-      const info = { status: res.status, body: res.text };
-      if (res.status === 403) {
-        throw new GQLError(
-          csrf
-            ? '控制台接口拒绝脚本请求（403），请改用 Token 模式'
-            : '控制台接口拒绝脚本请求（403，且页面读不到 XSRF-TOKEN），请改用 Token 模式',
-          { ...info, hint: 'use-token' },
-        );
-      }
-      return unwrapGraphQL(res.json, info);
-    } catch (e) {
-      throw e instanceof GQLError ? e : firstErr;
+      return parseGraphQL(r2.json, { status: r2.status, body: r2.text });
     }
+    let json = null;
+    try { json = await res.json(); } catch (e) { /* 可能是 HTML 拦截页 */ }
+    if (res.status === 403) {
+      throw new GQLError('控制台接口返回 403（风控/限流或登录态失效）', { status: 403, body: json ? clip(JSON.stringify(json), 200) : '' });
+    }
+    return parseGraphQL(json, { status: res.status, body: json ? '' : '' });
   }
 
-  async function gql(query) {
-    return isTokenMode() ? gqlViaToken(query) : gqlViaSession(query);
+  // 403 只做一次短退避重试（并发突发常被判风控，间隔后又好使）
+  async function gql(query, { retryOn403 = true } = {}) {
+    const run = () => (isTokenMode() ? requestToken(query) : requestSession(query));
+    try {
+      return await run();
+    } catch (e) {
+      if (retryOn403 && e.status === 403) {
+        await sleep(700);
+        return run();
+      }
+      throw e;
+    }
   }
 
   async function apiGet(pathAndQuery) {
@@ -282,13 +286,22 @@
   }
 
   /* =========================================================================
-   * 4. 各产品的采集任务
-   *    每个任务可有多个 query 变体：字段名/过滤类型在不同账号 schema 上
-   *    略有差异，前一个失败则自动降级到下一个；成功的变体会被记住，
-   *    下次刷新优先用它，避免每轮都重复踩坑。
+   * 4. 采集任务定义
+   *    每个任务可有多个变体（字段名在不同账号 schema 上略有差异），
+   *    前一个失败自动降级；成功的变体会被记住并持久化。
    * ========================================================================= */
   const P = (c, body) => `{viewer{accounts(filter:{accountTag:"${c.acc}"}){${body}}}}`;
-  const variantPick = new Map();
+  const wrapDataset = (dataset, rows) => ({ viewer: { accounts: [{ [dataset]: rows }] } });
+
+  const savedVariants = store.get(KEY.variants, {}) || {};
+  const variantPick = new Map(Object.entries(savedVariants).map(([k, v]) => [k, Number(v) || 0]));
+
+  function rememberVariant(jobId, idx) {
+    variantPick.set(jobId, idx);
+    const obj = {};
+    for (const [k, v] of variantPick) obj[k] = v;
+    store.set(KEY.variants, obj);
+  }
 
   const R2_CLASS_A = new Set([
     'PutObject', 'CopyObject', 'CreateMultipartUpload', 'CompleteMultipartUpload', 'UploadPart',
@@ -309,21 +322,23 @@
     {
       id: 'workers', name: 'Workers', keys: ['workersReq'],
       variants: [{
-        build: (c) => P(c, `workersInvocationsAdaptive(limit:1000,filter:{datetime_geq:"${c.dayStart}",datetime_lt:"${c.dayEnd}"}){sum{requests}}`),
+        dataset: 'workersInvocationsAdaptive',
+        field: (c) => `workersInvocationsAdaptive(limit:1000,filter:{datetime_geq:"${c.dayStart}",datetime_lt:"${c.dayEnd}"}){sum{requests}}`,
         extract: (d) => ({ workersReq: sumOf(account0(d).workersInvocationsAdaptive, 'sum.requests') }),
       }],
     },
     {
       id: 'kvOps', name: 'KV 操作', keys: ['kvRead', 'kvWrite'],
       variants: [{
-        build: (c) => P(c, `kvOperationsAdaptiveGroups(limit:100,filter:{date_geq:"${c.today}",date_leq:"${c.today}"}){dimensions{actionType} sum{requests}}`),
+        dataset: 'kvOperationsAdaptiveGroups',
+        field: (c) => `kvOperationsAdaptiveGroups(limit:100,filter:{date_geq:"${c.today}",date_leq:"${c.today}"}){dimensions{actionType} sum{requests}}`,
         extract: (d) => {
           const rows = account0(d).kvOperationsAdaptiveGroups || [];
           let read = 0;
           let write = 0;
           for (const r of rows) {
-            const n = num(gv(r, 'sum.requests'));
-            if (String(gv(r, 'dimensions.actionType') || '').toLowerCase() === 'read') read += n;
+            const n = num(gq(r, 'sum.requests'));
+            if (String(gq(r, 'dimensions.actionType') || '').toLowerCase() === 'read') read += n;
             else write += n;
           }
           return { kvRead: read, kvWrite: write };
@@ -334,16 +349,17 @@
       id: 'd1', name: 'D1', keys: ['d1RowsRead', 'd1RowsWritten'],
       variants: [
         {
-          build: (c) => P(c, `d1AnalyticsAdaptiveGroups(limit:100,filter:{date_geq:"${c.today}",date_leq:"${c.today}"}){sum{rowsRead rowsWritten}}`),
+          dataset: 'd1AnalyticsAdaptiveGroups',
+          field: (c) => `d1AnalyticsAdaptiveGroups(limit:100,filter:{date_geq:"${c.today}",date_leq:"${c.today}"}){sum{rowsRead rowsWritten}}`,
           extract: (d) => {
             const rows = account0(d).d1AnalyticsAdaptiveGroups || [];
             return { d1RowsRead: sumOf(rows, 'sum.rowsRead'), d1RowsWritten: sumOf(rows, 'sum.rowsWritten') };
           },
         },
         {
-          // 降级口径：只拿到查询条数，标记为近似值
-          approx: true,
-          build: (c) => P(c, `d1AnalyticsAdaptiveGroups(limit:100,filter:{date_geq:"${c.today}",date_leq:"${c.today}"}){sum{readQueries writeQueries}}`),
+          dataset: 'd1AnalyticsAdaptiveGroups',
+          approx: true, // 降级口径：只拿到查询条数
+          field: (c) => `d1AnalyticsAdaptiveGroups(limit:100,filter:{date_geq:"${c.today}",date_leq:"${c.today}"}){sum{readQueries writeQueries}}`,
           extract: (d) => {
             const rows = account0(d).d1AnalyticsAdaptiveGroups || [];
             return { d1RowsRead: sumOf(rows, 'sum.readQueries'), d1RowsWritten: sumOf(rows, 'sum.writeQueries') };
@@ -354,7 +370,8 @@
     {
       id: 'do', name: 'Durable Objects', keys: ['doRequests'],
       variants: [{
-        build: (c) => P(c, `durableObjectsInvocationsAdaptiveGroups(limit:1000,filter:{date_geq:"${c.today}",date_leq:"${c.today}"}){sum{requests}}`),
+        dataset: 'durableObjectsInvocationsAdaptiveGroups',
+        field: (c) => `durableObjectsInvocationsAdaptiveGroups(limit:1000,filter:{date_geq:"${c.today}",date_leq:"${c.today}"}){sum{requests}}`,
         extract: (d) => ({ doRequests: sumOf(account0(d).durableObjectsInvocationsAdaptiveGroups, 'sum.requests') }),
       }],
     },
@@ -362,11 +379,13 @@
       id: 'queues', name: 'Queues', keys: ['queueOps'],
       variants: [
         {
-          build: (c) => P(c, `queueMessageOperationsAdaptiveGroups(limit:1000,filter:{datetime_geq:"${c.dayStart}",datetime_lt:"${c.dayEnd}"}){count}`),
+          dataset: 'queueMessageOperationsAdaptiveGroups',
+          field: (c) => `queueMessageOperationsAdaptiveGroups(limit:1000,filter:{datetime_geq:"${c.dayStart}",datetime_lt:"${c.dayEnd}"}){count}`,
           extract: (d) => ({ queueOps: sumOf(account0(d).queueMessageOperationsAdaptiveGroups, 'count') }),
         },
         {
-          build: (c) => P(c, `queueMessageOperationsAdaptiveGroups(limit:1000,filter:{datetime_geq:"${c.today}",datetime_lt:"${c.tomorrow}"}){count}`),
+          dataset: 'queueMessageOperationsAdaptiveGroups',
+          field: (c) => `queueMessageOperationsAdaptiveGroups(limit:1000,filter:{datetime_geq:"${c.today}",datetime_lt:"${c.tomorrow}"}){count}`,
           extract: (d) => ({ queueOps: sumOf(account0(d).queueMessageOperationsAdaptiveGroups, 'count') }),
         },
       ],
@@ -375,16 +394,19 @@
       id: 'ai', name: 'Workers AI', keys: ['aiNeurons'],
       variants: [
         {
-          build: (c) => P(c, `aiInferenceAdaptiveGroups(limit:1000,filter:{datetime_geq:"${c.dayStart}",datetime_lt:"${c.dayEnd}"}){sum{totalNeurons}}`),
+          dataset: 'aiInferenceAdaptiveGroups',
+          field: (c) => `aiInferenceAdaptiveGroups(limit:1000,filter:{datetime_geq:"${c.dayStart}",datetime_lt:"${c.dayEnd}"}){sum{totalNeurons}}`,
           extract: (d) => ({ aiNeurons: sumOf(account0(d).aiInferenceAdaptiveGroups, 'sum.totalNeurons') }),
         },
         {
-          build: (c) => P(c, `aiInferenceAdaptiveGroups(limit:1000,filter:{datetime_geq:"${c.dayStart}",datetime_lt:"${c.dayEnd}"}){sum{neurons}}`),
+          dataset: 'aiInferenceAdaptiveGroups',
+          field: (c) => `aiInferenceAdaptiveGroups(limit:1000,filter:{datetime_geq:"${c.dayStart}",datetime_lt:"${c.dayEnd}"}){sum{neurons}}`,
           extract: (d) => ({ aiNeurons: sumOf(account0(d).aiInferenceAdaptiveGroups, 'sum.neurons') }),
         },
         {
-          build: (c) => P(c, `aiInferenceAdaptiveGroups(limit:1000,filter:{datetime_geq:"${c.dayStart}",datetime_lt:"${c.dayEnd}"}){count}`),
+          dataset: 'aiInferenceAdaptiveGroups',
           approx: true,
+          field: (c) => `aiInferenceAdaptiveGroups(limit:1000,filter:{datetime_geq:"${c.dayStart}",datetime_lt:"${c.dayEnd}"}){count}`,
           extract: (d) => ({ aiNeurons: sumOf(account0(d).aiInferenceAdaptiveGroups, 'count') }),
         },
       ],
@@ -392,16 +414,16 @@
     {
       id: 'r2Ops', name: 'R2 操作', keys: ['r2ClassA', 'r2ClassB'],
       variants: [{
-        build: (c) => P(c, `r2OperationsAdaptiveGroups(limit:1000,filter:{datetime_geq:"${c.monthStart}",datetime_lt:"${c.monthEnd}"}){dimensions{actionType} sum{requests}}`),
-        // Class A/B 的归类由本地规则推断
-        approx: true,
+        dataset: 'r2OperationsAdaptiveGroups',
+        approx: true, // Class A/B 的归类由本地规则推断
+        field: (c) => `r2OperationsAdaptiveGroups(limit:1000,filter:{datetime_geq:"${c.monthStart}",datetime_lt:"${c.monthEnd}"}){dimensions{actionType} sum{requests}}`,
         extract: (d) => {
           const rows = account0(d).r2OperationsAdaptiveGroups || [];
           let a = 0;
           let b = 0;
           for (const r of rows) {
-            const n = num(gv(r, 'sum.requests'));
-            if (r2Class(gv(r, 'dimensions.actionType')) === 'A') a += n; else b += n;
+            const n = num(gq(r, 'sum.requests'));
+            if (r2Class(gq(r, 'dimensions.actionType')) === 'A') a += n; else b += n;
           }
           return { r2ClassA: a, r2ClassB: b };
         },
@@ -410,10 +432,11 @@
     {
       id: 'kvStorage', name: 'KV 存储', keys: ['kvStorage'],
       variants: [{
-        build: (c) => P(c, `kvStorageAdaptiveGroups(limit:100,filter:{date_geq:"${c.twoDaysAgo}",date_leq:"${c.today}"}){max{byteCount}}`),
+        dataset: 'kvStorageAdaptiveGroups',
+        field: (c) => `kvStorageAdaptiveGroups(limit:100,filter:{date_geq:"${c.twoDaysAgo}",date_leq:"${c.today}"}){max{byteCount}}`,
         extract: (d) => {
           const rows = account0(d).kvStorageAdaptiveGroups || [];
-          return { kvStorage: rows.reduce((m, r) => Math.max(m, num(gv(r, 'max.byteCount'))), 0) };
+          return { kvStorage: rows.reduce((m, r) => Math.max(m, num(gq(r, 'max.byteCount'))), 0) };
         },
       }],
     },
@@ -421,17 +444,19 @@
       id: 'd1Storage', name: 'D1 存储', keys: ['d1Storage'],
       variants: [
         {
-          build: (c) => P(c, `d1StorageAdaptiveGroups(limit:100,filter:{date_geq:"${c.twoDaysAgo}",date_leq:"${c.today}"}){max{databaseSizeBytes}}`),
+          dataset: 'd1StorageAdaptiveGroups',
+          field: (c) => `d1StorageAdaptiveGroups(limit:100,filter:{date_geq:"${c.twoDaysAgo}",date_leq:"${c.today}"}){max{databaseSizeBytes}}`,
           extract: (d) => {
             const rows = account0(d).d1StorageAdaptiveGroups || [];
-            return { d1Storage: rows.reduce((m, r) => Math.max(m, num(gv(r, 'max.databaseSizeBytes'))), 0) };
+            return { d1Storage: rows.reduce((m, r) => Math.max(m, num(gq(r, 'max.databaseSizeBytes'))), 0) };
           },
         },
         {
-          build: (c) => P(c, `d1StorageAdaptiveGroups(limit:100,filter:{date_geq:"${c.twoDaysAgo}",date_leq:"${c.today}"}){max{databaseSize}}`),
+          dataset: 'd1StorageAdaptiveGroups',
+          field: (c) => `d1StorageAdaptiveGroups(limit:100,filter:{date_geq:"${c.twoDaysAgo}",date_leq:"${c.today}"}){max{databaseSize}}`,
           extract: (d) => {
             const rows = account0(d).d1StorageAdaptiveGroups || [];
-            return { d1Storage: rows.reduce((m, r) => Math.max(m, num(gv(r, 'max.databaseSize'))), 0) };
+            return { d1Storage: rows.reduce((m, r) => Math.max(m, num(gq(r, 'max.databaseSize'))), 0) };
           },
         },
       ],
@@ -439,19 +464,28 @@
     {
       id: 'r2Storage', name: 'R2 存储', keys: ['r2Storage'],
       variants: [{
-        build: (c) => P(c, `r2StorageAdaptiveGroups(limit:100,filter:{datetime_geq:"${c.storageStart}",datetime_lt:"${c.storageEnd}"}){max{payloadSize metadataSize}}`),
+        dataset: 'r2StorageAdaptiveGroups',
+        field: (c) => `r2StorageAdaptiveGroups(limit:100,filter:{datetime_geq:"${c.storageStart}",datetime_lt:"${c.storageEnd}"}){max{payloadSize metadataSize}}`,
         extract: (d) => {
           const rows = account0(d).r2StorageAdaptiveGroups || [];
           return {
-            r2Storage: rows.reduce((m, r) => Math.max(m, num(gv(r, 'max.payloadSize')) + num(gv(r, 'max.metadataSize'))), 0),
+            r2Storage: rows.reduce((m, r) => Math.max(m, num(gq(r, 'max.payloadSize')) + num(gq(r, 'max.metadataSize'))), 0),
           };
         },
       }],
     },
   ];
 
+  const JOB_BY_ID = new Map(JOBS.map((j) => [j.id, j]));
+
+  // 按过滤器类型分组，同组 dataset 可以合并进一个 GraphQL 文档（用 alias）
+  const GROUPS = [
+    { id: 'date', jobs: ['kvOps', 'd1', 'do', 'kvStorage', 'd1Storage'] },
+    { id: 'datetime', jobs: ['workers', 'queues', 'ai', 'r2Ops', 'r2Storage'] },
+  ].map((g) => ({ ...g, members: g.jobs.map((id) => JOB_BY_ID.get(id)) }));
+
   /* =========================================================================
-   * 5. 采集主流程
+   * 5. 采集流程
    * ========================================================================= */
   function buildCtx(accountId) {
     const now = new Date();
@@ -472,63 +506,135 @@
     };
   }
 
-  // 优先尝试上次成功的变体，失败再依次尝试其余变体
-  async function runJob(job, ctx) {
-    const preferred = variantPick.get(job.id) || 0;
-    const order = [preferred, ...job.variants.keys()].filter((v, i, arr) => arr.indexOf(v) === i);
+  const currentVariant = (job) => job.variants[variantPick.get(job.id) || 0] || job.variants[0];
+
+  function applyValues(result, job, values, approx) {
+    Object.assign(result.values, values);
+    if (approx) for (const k of job.keys) result.approx[k] = true;
+  }
+
+  function markFailed(result, job, message) {
+    const msg = clip(message || '数据集不可用', 140);
+    for (const k of job.keys) result.failed[k] = msg;
+    result.diag.push({ job: job.id, message: clip(message, 240) });
+  }
+
+  // 合并查询：一次请求拿一组 dataset，逐个 alias 判定成败
+  async function runGroup(group, ctx, result) {
+    const parts = [];
+    const map = [];
+    group.members.forEach((job, i) => {
+      const vi = variantPick.get(job.id) || 0;
+      const variant = job.variants[vi] || job.variants[0];
+      parts.push(`a${i}: ${variant.field(ctx)}`);
+      map.push({ job, alias: `a${i}`, vi });
+    });
+    result.requests += 1; // 统计「尝试次数」，失败的那次也算，便于诊断真实开销
+    const { data, errors } = await gql(P(ctx, parts.join(' ')));
+
+    let anyOk = false;
+    for (const { job, alias, vi } of map) {
+      const variant = job.variants[vi] || job.variants[0];
+      const rows = gq(data, `viewer.accounts.0.${alias}`);
+      if (rows == null) {
+        const err = errors.find((e) => Array.isArray(e.path) && e.path.includes(alias));
+        markFailed(result, job, err ? err.message : '该数据集在合并查询中无返回');
+        continue;
+      }
+      anyOk = true;
+      applyValues(result, job, variant.extract(wrapDataset(variant.dataset, rows)), variant.approx);
+    }
+    return anyOk;
+  }
+
+  // 单项查询（合并失败时的兜底，也负责把坏变体纠正掉）
+  async function runJob(job, ctx, result) {
+    const order = [variantPick.get(job.id) || 0, ...job.variants.keys()].filter((v, i, a) => a.indexOf(v) === i);
     let lastErr = null;
     for (const idx of order) {
       const variant = job.variants[idx];
       if (!variant) continue;
       try {
-        const data = await gql(variant.build(ctx));
-        variantPick.set(job.id, idx);
-        return { values: variant.extract(data), approx: !!variant.approx };
+        result.requests += 1;
+        const { data, errors } = await gql(P(ctx, variant.field(ctx)));
+        if (errors && errors.length) throw new GQLError(errors[0].message || '数据集不可用');
+        rememberVariant(job.id, idx);
+        applyValues(result, job, variant.extract(data), variant.approx);
+        return true;
       } catch (e) {
         lastErr = e;
-        if (e.authError) break; // 鉴权类错误换变体也没用，直接上抛
+        // 鉴权失败换变体没用；被风控（403）换变体也没用，直接上报节流
+        if (e.authError) break;
+        if (e.throttled) {
+          markFailed(result, job, e.message);
+          return 'throttled';
+        }
       }
     }
-    throw lastErr || new Error('采集失败');
+    markFailed(result, job, lastErr ? lastErr.message : '采集失败');
+    return 'failed';
   }
 
   async function collect(accountId) {
     const ctx = buildCtx(accountId);
-    const result = { values: {}, approx: {}, failed: {}, diag: [], ts: Date.now() };
-    const done = new Set();
-    let authError = null;
+    httpCount = 0;
+    const result = { values: {}, approx: {}, failed: {}, diag: [], ts: Date.now(), requests: 0 };
+    let throttleErr = null;
 
-    for (let i = 0; i < JOBS.length; i += 3) {
-      const batch = JOBS.slice(i, i + 3);
-      const settled = await Promise.allSettled(batch.map((job) => runJob(job, ctx)));
-      settled.forEach((s, idx) => {
-        const job = batch[idx];
-        done.add(job.id);
-        if (s.status === 'fulfilled') {
-          Object.assign(result.values, s.value.values);
-          if (s.value.approx) for (const k of job.keys) result.approx[k] = true;
-        } else {
-          const err = s.reason;
-          for (const k of job.keys) result.failed[k] = clip(err?.message || err, 140);
-          result.diag.push({
-            job: job.id,
-            status: err?.status || 0,
-            message: clip(err?.message || err, 240),
-            body: clip(err?.body, 240),
-          });
-          if (err?.authError && !authError) authError = err;
+    const markGroupFailed = (group, message) => {
+      for (const job of group.members) {
+        const alreadyDone = job.keys.every((k) => k in result.values || k in result.failed);
+        if (!alreadyDone) markFailed(result, job, message);
+      }
+    };
+
+    for (const group of GROUPS) {
+      if (throttleErr) {
+        // 已经判定被拦，剩余分组不再浪费请求
+        markGroupFailed(group, throttleErr.message);
+        continue;
+      }
+
+      let groupOk = false;
+      let blocked = null;
+      try {
+        groupOk = await runGroup(group, ctx, result);
+      } catch (e) {
+        if (e.authError || e.throttled) blocked = e;
+      }
+
+      if (!groupOk) {
+        if (blocked) {
+          // 网络层就被拒（403 且重试仍失败）：逐项重试没有意义
+          throttleErr = blocked;
+          markGroupFailed(group, blocked.message);
+          continue;
         }
-      });
-      if (authError) break; // 鉴权失败就不再打剩下的请求
+        // 合并文档校验失败等：逐项兜底，串行 + 间隔，避免再触发风控
+        for (const job of group.members) {
+          if (throttleErr) {
+            markGroupFailed(group, throttleErr.message);
+            break;
+          }
+          const alreadyDone = job.keys.every((k) => k in result.values || k in result.failed);
+          if (alreadyDone) continue;
+          const st = await runJob(job, ctx, result);
+          if (st === 'throttled') throttleErr = new GQLError('控制台接口 403（风控/限流）', { status: 403 });
+          await sleep(180);
+        }
+      }
     }
 
-    if (authError) {
-      result.authError = clip(authError.message, 200);
-      result.authHint = authError.hint || (isTokenMode() ? 'token-invalid' : 'use-token');
-      for (const job of JOBS) {
-        if (done.has(job.id)) continue;
-        for (const k of job.keys) result.failed[k] = '鉴权失败，已中止';
-      }
+    result.requests = httpCount;
+
+    const gotAny = Object.keys(result.values).length > 0;
+    if (!gotAny && throttleErr) {
+      result.fatal = throttleErr.message;
+      result.fatalStatus = throttleErr.status || 0;
+      result.authError = throttleErr.authError ? throttleErr.message : '';
+    } else if (!gotAny) {
+      const first = Object.values(result.failed)[0] || '未取到任何数据';
+      result.fatal = String(first);
     }
     return result;
   }
@@ -572,6 +678,7 @@
     .btn.primary:hover { background: #ff9330; border-color: #ff9330; }
     .meta { padding: 8px 14px; font-size: 11.5px; color: #8b93a3; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
     .meta b { color: #b9c0cd; font-weight: 600; }
+    .meta .stale { color: #f0c08a; }
     .body { padding: 4px 14px 14px; overflow-y: auto; }
     .body::-webkit-scrollbar, .cfg::-webkit-scrollbar, .diag::-webkit-scrollbar { width: 8px; }
     .body::-webkit-scrollbar-thumb, .cfg::-webkit-scrollbar-thumb, .diag::-webkit-scrollbar-thumb { background: #333846; border-radius: 8px; }
@@ -579,6 +686,8 @@
       background: #2a1f14; border: 1px solid #5a3d18; color: #f0c08a; }
     .banner b { color: #ffb260; }
     .banner .acts { display: flex; gap: 8px; margin-top: 8px; }
+    .notice { margin: 8px 0 0; padding: 7px 10px; border-radius: 8px; font-size: 11px; line-height: 1.6;
+      background: #1e2128; border: 1px solid #2c313b; color: #9aa2b1; }
     .sec { margin-top: 12px; }
     .sec-h { display: flex; align-items: baseline; gap: 8px; font-size: 11px; letter-spacing: .6px;
       color: #7f8798; text-transform: uppercase; margin-bottom: 8px; }
@@ -604,8 +713,6 @@
     .cfg { padding: 4px 14px 16px; overflow-y: auto; }
     .cfg h4 { margin: 14px 0 8px; font-size: 12px; color: #c8cdd8; font-weight: 600; }
     .cfg h4:first-child { margin-top: 8px; }
-    .cfg label { display: flex; gap: 8px; align-items: flex-start; font-size: 12px; color: #a7aebc; margin-bottom: 8px; cursor: pointer; line-height: 1.55; }
-    .cfg label b { color: #d6dae2; font-weight: 600; }
     .cfg input[type=text], .cfg input[type=password], .cfg select {
       width: 100%; background: #1d2027; border: 1px solid #333846; color: #e7e9ee;
       border-radius: 8px; padding: 7px 9px; font-size: 12px; outline: none; font-family: inherit;
@@ -640,9 +747,9 @@
 
     if (failed || value === undefined || value === null || Number.isNaN(value)) {
       row.classList.add('dead');
-      row.title = failed ? `该数据集不可用：${failed}` : '暂无数据';
+      row.title = failed ? `该数据集本次未取到：${failed}` : '暂无数据';
       row.innerHTML = `<div class="l1"><span class="name">${spec.label}</span>
-        <span class="val">不可用</span><span class="pct">—</span></div>
+        <span class="val">未取到</span><span class="pct">—</span></div>
         <div class="bar"><i style="width:0%"></i></div>`;
       return row;
     }
@@ -726,6 +833,8 @@
     snapshot: store.get(KEY.snapshot, null),
     loading: false,
     timer: null,
+    lastRefreshAt: 0,
+    staleNotice: '',
   };
 
   let ui = null;
@@ -747,18 +856,8 @@
     const when = snap && snap.ts ? hhmmss(new Date(snap.ts)) : '—';
     const mins = store.get(KEY.interval, 5);
     const mode = isTokenMode() ? 'Token 模式' : '会话模式';
-    ui.meta.innerHTML = `账户 <b>${(acc && acc.name) || '当前账号'}</b> · <b>${mode}</b> · 更新于 <b>${when}</b> · 每 ${mins} 分钟刷新`;
-  }
-
-  function bannerHTML(snapshot) {
-    if (!snapshot || !snapshot.authError) return '';
-    const isToken = isTokenMode();
-    const msg = isToken
-      ? 'Token 鉴权失败：请确认令牌有效，且勾选了 <code>Account Analytics : Read</code>（Account 级别权限）。'
-      : '控制台接口拒绝了脚本请求（HTTP 403）。Cloudflare 对 dash 的接口有 CSRF / 风控校验，脚本无法稳定复用 Cookie。<br>请切换到 <b>Token 模式</b>：只需一个只读令牌，1 分钟搞定。';
-    return `<div class="banner"><b>数据采集失败</b><br>${msg}
-      <div class="acts"><button class="btn primary" data-act="${isToken ? 'settings' : 'settings'}">${isToken ? '检查设置' : '去填 Token'}</button>
-      <button class="btn" data-act="diag">查看诊断</button></div></div>`;
+    const stale = state.staleNotice ? ` · <span class="stale">${state.staleNotice}</span>` : '';
+    ui.meta.innerHTML = `账户 <b>${(acc && acc.name) || '当前账号'}</b> · <b>${mode}</b> · 更新于 <b>${when}</b> · 每 ${mins} 分钟刷新${stale}`;
   }
 
   function renderBody() {
@@ -771,8 +870,18 @@
       return;
     }
 
-    const banner = bannerHTML(state.snapshot);
-    if (banner) body.insertAdjacentHTML('beforeend', banner);
+    const snap = state.snapshot;
+    if (snap.fatal) {
+      const isToken = isTokenMode();
+      const msg = isToken && snap.authError
+        ? 'Token 鉴权失败：请确认令牌有效，并勾选了 <code>Account Analytics : Read</code>。'
+        : `所有数据集都没取到：${clip(snap.fatal, 120)}<br>会话模式偶发 403 属控制台风控，可直接再点一次刷新；持续失败请改用 Token 模式。`;
+      body.insertAdjacentHTML('beforeend', `<div class="banner"><b>数据采集失败</b><br>${msg}
+        <div class="acts"><button class="btn primary" data-act="settings">${isToken ? '检查设置' : '切换 Token 模式'}</button>
+        <button class="btn" data-act="diag">查看诊断</button></div></div>`);
+    } else if (Object.keys(snap.failed || {}).length) {
+      body.insertAdjacentHTML('beforeend', `<div class="notice">有 ${Object.keys(snap.failed).length} 项本次未取到（灰色行），其余正常。悬停灰色行可看原因。</div>`);
+    }
 
     for (const sec of SECTIONS) {
       const wrap = document.createElement('div');
@@ -781,27 +890,30 @@
       h.className = 'sec-h';
       h.innerHTML = `<span>${sec.title}</span><span class="n">${sec.note}</span>`;
       wrap.appendChild(h);
-      for (const key of sec.keys) wrap.appendChild(buildRow(key, state.snapshot));
+      for (const key of sec.keys) wrap.appendChild(buildRow(key, snap));
       body.appendChild(wrap);
     }
 
     const foot = document.createElement('div');
     foot.className = 'foot';
-    foot.innerHTML = `额度值来自 cloudflare.com/plans 免费套餐。<span class="star">*</span> 为近似口径。<br>v${VERSION} · <span class="star">*</span> 点进度条可查看剩余额度`;
+    foot.innerHTML = `额度值来自 cloudflare.com/plans 免费套餐。<span class="star">*</span> 为近似口径。<br>v${VERSION} · 本次 ${snap.requests || 0} 个 GraphQL 请求 · 点进度条看剩余额度`;
     body.appendChild(foot);
   }
 
   function diagText() {
     const snap = state.snapshot;
-    if (!snap || !snap.diag || !snap.diag.length) return '暂无错误记录。';
-    const head = [
+    const lines = [
+      `版本: v${VERSION}`,
       `模式: ${isTokenMode() ? 'token' : 'session'}`,
-      `时间: ${new Date(snap.ts).toISOString()}`,
-      `账户: ${snap.accountId || '-'}`,
-      snap.authError ? `鉴权错误: ${snap.authError}` : null,
+      `时间: ${snap && snap.ts ? new Date(snap.ts).toISOString() : '-'}`,
+      `账户: ${(snap && snap.accountId) || '-'}`,
+      `GraphQL 请求数: ${(snap && snap.requests) || 0}`,
+      `成功指标: ${snap ? Object.keys(snap.values || {}).join(',') || '-' : '-'}`,
+      snap && snap.fatal ? `致命错误: ${snap.fatal}` : null,
       '',
-    ].filter(Boolean).join('\n');
-    return head + snap.diag.map((d) => `[${d.job}] HTTP ${d.status || '-'} ${d.message}${d.body ? `\n  body: ${d.body}` : ''}`).join('\n');
+    ].filter((x) => x !== null);
+    if (!snap || !snap.diag || !snap.diag.length) return lines.concat('暂无任务级错误记录。').join('\n');
+    return lines.concat(snap.diag.map((d) => `[${d.job}] ${d.message}`)).join('\n');
   }
 
   function renderSettings() {
@@ -810,13 +922,12 @@
     const mode = isTokenMode() ? 'token' : 'session';
     const token = getToken();
     const interval = store.get(KEY.interval, 5);
-    const snap = state.snapshot;
 
     cfg.innerHTML = `
       <h4>数据来源</h4>
       <select data-f="mode">
-        <option value="token"${mode === 'token' ? ' selected' : ''}>Token 模式（推荐，稳定）</option>
-        <option value="session"${mode === 'session' ? ' selected' : ''}>会话模式（复用控制台登录，可能被 403）</option>
+        <option value="session"${mode === 'session' ? ' selected' : ''}>会话模式（零配置，复用控制台登录）</option>
+        <option value="token"${mode === 'token' ? ' selected' : ''}>Token 模式（只读令牌，最稳）</option>
       </select>
       <div class="hint" data-el="modeHint"></div>
 
@@ -824,7 +935,7 @@
         <h4>API Token</h4>
         <input type="password" data-f="token" placeholder="粘贴令牌（只需 Account Analytics : Read）" value="${token.replace(/"/g, '&quot;')}">
         <div class="hint">
-          生成地址：控制台 → 我的资料 → API 令牌 → 创建令牌 → 自定义令牌，权限选
+          生成路径：头像 → 我的资料 → API 令牌 → 创建令牌 → 自定义令牌，权限选
           <code>Account</code> / <code>Account Analytics</code> / <code>Read</code>。
           令牌仅存于本机油猴存储，只用于请求 <code>api.cloudflare.com</code>。
         </div>
@@ -853,8 +964,8 @@
       const m = cfg.querySelector('[data-f=mode]').value;
       tokenBox.style.display = m === 'token' ? 'block' : 'none';
       modeHint.innerHTML = m === 'token'
-        ? '用只读令牌直连官方 GraphQL API，不受控制台 CSRF/风控影响，最稳。'
-        : '复用 dash.cloudflare.com 的登录 Cookie。部分账号会被 403 拒绝，届时请改回 Token 模式。';
+        ? '用只读令牌直连官方 GraphQL API，不受控制台 CSRF/风控影响。'
+        : '复用 dash 登录 Cookie（每轮仅 2 个合并请求）。偶发 403 是控制台风控，重试即可；持续失败建议改用 Token 模式。';
     };
     syncMode();
     cfg.querySelector('[data-f=mode]').addEventListener('change', syncMode);
@@ -874,7 +985,7 @@
       store.set(KEY.interval, nextInterval);
       store.set(KEY.accounts, []);
       state.accounts = [];
-      variantPick.clear();
+      state.staleNotice = '';
       ui.toast('设置已保存，正在刷新…');
       showSettings(false);
       scheduleAutoRefresh();
@@ -891,8 +1002,8 @@
       try {
         const acc = await resolveAccount();
         const ctx = buildCtx(acc);
-        const data = await gql(JOBS[0].variants[0].build(ctx));
-        const n = num(gv(account0(data), 'workersInvocationsAdaptive.0.sum.requests'));
+        const { data } = await gql(P(ctx, currentVariant(JOB_BY_ID.get('workers')).field(ctx)));
+        const n = num(gq(account0(data), 'workersInvocationsAdaptive.0.sum.requests'));
         diagEl.textContent = `✓ 连接成功\n模式: ${m}\n账户: ${acc}\n今日 Workers 请求: ${fmtCount(n)}`;
         ui.toast('连接成功');
       } catch (e) {
@@ -904,6 +1015,7 @@
     cfg.querySelector('[data-act=clearcache]').addEventListener('click', () => {
       store.set(KEY.snapshot, null);
       state.snapshot = null;
+      state.staleNotice = '';
       renderBody();
       renderMeta();
       diagEl.textContent = '暂无错误记录。';
@@ -969,12 +1081,11 @@
   }
 
   async function resolveAccount() {
-    // URL 里的 32 位十六进制账户 ID 永远是最可靠来源，先取它
     const fromUrl = accountFromUrl();
     if (fromUrl) {
       state.accountId = fromUrl;
       store.set(KEY.account, fromUrl);
-      ensureAccounts().then(() => renderMeta()).catch(() => {});
+      if (!state.accounts.length) ensureAccounts().then(() => renderMeta()).catch(() => {});
       return fromUrl;
     }
     await ensureAccounts().catch(() => {});
@@ -994,30 +1105,48 @@
   async function refresh(force) {
     if (!ui) return;
     if (state.loading && !force) return;
+    // 防抖：2 秒内重复触发（展开面板 + 点击刷新）直接忽略，避免自己把自己打到风控
+    if (!force && Date.now() - state.lastRefreshAt < 2000) return;
+    state.lastRefreshAt = Date.now();
     setBusy(true);
     try {
       const acc = await resolveAccount();
       const snapshot = await collect(acc);
       snapshot.accountId = acc;
-      state.snapshot = snapshot;
-      store.set(KEY.snapshot, snapshot);
+
+      const gotAny = Object.keys(snapshot.values).length > 0;
+      const hadGood = state.snapshot && Object.keys(state.snapshot.values || {}).length > 0;
+
+      if (!gotAny && hadGood) {
+        // 本轮全灭但上次有数据：保留旧快照，不要用空数据把面板清空
+        state.staleNotice = `${hhmmss(new Date())} 刷新失败，展示上次数据`;
+        if (snapshot.fatal && isTokenMode()) {
+          state.snapshot.fatal = snapshot.fatal;
+          state.snapshot.authError = snapshot.authError;
+        }
+        ui.toast(`刷新失败（${clip(snapshot.fatal || '未取到数据', 60)}），已保留上次数据`);
+      } else {
+        state.staleNotice = '';
+        state.snapshot = snapshot;
+        store.set(KEY.snapshot, snapshot);
+        if (snapshot.fatal) {
+          ui.toast(`采集失败：${clip(snapshot.fatal, 70)}`);
+        } else {
+          const dead = Object.keys(snapshot.failed || {}).length;
+          if (dead) ui.toast(`${dead} 项未取到（灰色行），其余正常`);
+        }
+      }
+
       renderMeta();
       renderBody();
       if (ui.settingsOpen) renderSettings();
-
-      if (snapshot.authError) {
-        ui.toast(isTokenMode() ? 'Token 鉴权失败，请检查设置' : '会话模式被拒绝（403），请改用 Token 模式');
-      } else {
-        const dead = Object.keys(snapshot.failed || {}).length;
-        if (dead) ui.toast(`${dead} 项数据集不可用（悬停灰色项可见原因）`);
-      }
     } catch (e) {
       const msg = clip(e && e.message ? e.message : e, 160);
       ui.toast(`读取失败：${msg}`);
       if (!state.snapshot) {
         ui.body.innerHTML = `<div class="empty">读取失败：${msg}<br><br>
           · 建议在「设置」里用 <code>Token 模式</code>（只需 Account Analytics : Read）；<br>
-          · 会话模式如提示 403，是控制台的风控/CSRF 拦截，属预期。</div>`;
+          · 会话模式偶发 403 是控制台风控，重试即可。</div>`;
       }
     } finally {
       setBusy(false);
@@ -1078,7 +1207,10 @@
 
   // 调试/测试接口（控制台输入 __CFU__ 即可查看内部能力）
   try {
-    globalThis.__CFU__ = { JOBS, LIMITS, SPECS, SECTIONS, buildCtx, collect, runJob, gql, fmt, fmtCount, fmtBytes, r2Class, store, variantPick };
+    globalThis.__CFU__ = {
+      VERSION, JOBS, GROUPS, LIMITS, SPECS, SECTIONS, buildCtx, collect, runJob, runGroup,
+      gql, fmt, fmtCount, fmtBytes, r2Class, store, variantPick,
+    };
   } catch (e) { /* 忽略 */ }
 
   // 非浏览器环境（单元测试）只导出接口，不挂载 UI
