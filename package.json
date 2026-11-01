@@ -1,0 +1,14 @@
+{
+  "name": "cf-free-usage",
+  "version": "1.0.0",
+  "description": "",
+  "main": "cf-free-usage-panel.user.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "type": "commonjs",
+  "devDependencies": {
+    "jsdom": "^30.1.3"
+  }
+}
