@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>打赏 / Donate · Cloudflare 免费额度用量面板</title>
+<meta name="description" content="支持 Cloudflare 免费额度用量面板这个开源油猴脚本 / Support the Cloudflare free tier usage panel userscript">
+<style>
+  :root {
+    --bg: #101216;
+    --card: #16181d;
+    --line: #262a33;
+    --fg: #e7e9ee;
+    --muted: #8b93a3;
+    --accent: #f6821f;
+    --green: #22c55e;
+    --blue: #3884ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background:
+      radial-gradient(900px 500px at 15% -10%, rgba(246,130,31,.13), transparent 65%),
+      radial-gradient(700px 400px at 95% 0%, rgba(56,132,255,.10), transparent 60%), var(--bg);
+    color: var(--fg);
+    font: 15px/1.7 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+    display: flex; justify-content: center; padding: 48px 20px 64px;
+  }
+  .wrap { width: 100%; max-width: 880px; }
+  header { text-align: center; margin-bottom: 34px; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--accent);
+    box-shadow: 0 0 10px var(--accent); margin-right: 8px; vertical-align: 2px; }
+  h1 { font-size: 26px; margin: 0 0 6px; letter-spacing: .3px; }
+  .sub { color: var(--muted); font-size: 13.5px; }
+  .sub a { color: var(--muted); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 16px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 20px;
+    display: flex; flex-direction: column; align-items: center; gap: 12px; text-align: center;
+  }
+  .card h2 { font-size: 14px; margin: 0; letter-spacing: .6px; text-transform: uppercase; color: #c8cdd8; }
+  .card p { margin: 0; font-size: 12px; color: var(--muted); line-height: 1.6; }
+  .qr { width: 220px; height: 220px; border-radius: 12px; background: #0c0e12; display: block; object-fit: contain;
+    border: 1px solid #2a2e37; }
+  .qr-note { font-size: 11px; color: #6f7787; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px; padding: 11px 20px; border-radius: 10px;
+    font-size: 14px; font-weight: 600; text-decoration: none; border: 1px solid transparent; cursor: pointer;
+    transition: transform .15s ease, box-shadow .15s ease, background .15s ease;
+  }
+  .btn:hover { transform: translateY(-1px); }
+  .btn-paypal { background: #ffc439; color: #10314e; box-shadow: 0 6px 18px rgba(255,195,57,.22); }
+  .btn-paypal:hover { background: #ffd166; }
+  .btn-ghost { background: #23272f; color: #cfd4de; border-color: #333846; font-weight: 500; font-size: 13px; }
+  .btn-ghost:hover { background: #2c313b; color: #fff; }
+  #paypal-container-3EL6CKZ57Y8NE { min-height: 48px; width: 100%; display: flex; justify-content: center; }
+  .fallback { font-size: 11.5px; color: #6f7787; }
+  .fallback a { color: #9aa2b1; }
+  footer { margin-top: 34px; text-align: center; font-size: 12px; color: #5f6674; line-height: 2; }
+  footer a { color: #8b93a3; }
+  .tip {
+    margin-top: 26px; padding: 12px 16px; border-radius: 12px; font-size: 12px; line-height: 1.7;
+    background: #1a1d24; border: 1px solid #262a33; color: #9aa2b1;
+  }
+  .tip b { color: #ffb260; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1><span class="dot"></span>打赏 / Donate</h1>
+    <div class="sub">
+      如果 <a href="https://github.com/ChaunceyXCX/cloudflare-free-usage-panel" target="_blank" rel="noopener">Cloudflare 免费额度用量面板</a>
+      帮你省了时间，可以请我喝杯咖啡 ☕<br>
+      <span style="font-size:12px">If this uscript saved you some time, you can buy me a coffee. Totally optional.</span>
+    </div>
+  </header>
+
+  <div class="grid">
+    <!-- PayPal：Hosted Buttons（client-id + hosted-button-id 都是公开信息） -->
+    <section class="card">
+      <h2>PayPal</h2>
+      <p>支持信用卡 / 借记卡，无需 PayPal 账号<br><span style="font-size:11px">Cards accepted, no PayPal account needed</span></p>
+      <div id="paypal-container-3EL6CKZ57Y8NE"></div>
+      <a class="btn btn-ghost" href="https://www.paypal.com/ncp/payment/3EL6CKZ57Y8NE" target="_blank" rel="noopener">直达支付页 / Open payment page ↗</a>
+      <div class="fallback">按钮被广告拦截插件挡住时，用上面这个链接</div>
+    </section>
+
+    <section class="card">
+      <h2>微信 / WeChat Pay</h2>
+      <img class="qr" src="../assets/donate/wechat.png" alt="微信赞赏码 / WeChat Pay QR">
+      <p class="qr-note">占位图，待替换为真实收款码</p>
+    </section>
+
+    <section class="card">
+      <h2>支付宝 / Alipay</h2>
+      <img class="qr" src="../assets/donate/alipay.png" alt="支付宝收款码 / Alipay QR">
+      <p class="qr-note">占位图，待替换为真实收款码</p>
+    </section>
+  </div>
+
+  <div class="tip">
+    <b>更省事的方式</b>：给仓库点个 ⭐ Star 或提个 Issue，对我来说和打赏同等重要。<br>
+    <b>Even easier:</b> a ⭐ Star or an issue on GitHub counts just as much.
+  </div>
+
+  <footer>
+    <a href="https://github.com/ChaunceyXCX/cloudflare-free-usage-panel" target="_blank" rel="noopener">GitHub 仓库</a> ·
+    <a href="https://github.com/ChaunceyXCX/cloudflare-free-usage-panel/issues" target="_blank" rel="noopener">反馈 / Issues</a> ·
+    <a href="https://github.com/ChaunceyXCX/cloudflare-free-usage-panel/blob/master/README.md" target="_blank" rel="noopener">README</a>
+    <br>MIT © chauncey
+  </footer>
+</div>
+
+<!-- PayPal Hosted Buttons SDK -->
+<script
+  src="https://www.paypal.com/sdk/js?client-id=BAA8VSvodWJ0gGPLtnto27pADZoBZxnCPG3kCDk6QgtE2i6kvIq_ZhwjJjWlb6FsPaQPiLU7tRWF9Rx4z0&components=hosted-buttons&disable-funding=venmo&currency=USD">
+</script>
+<script>
+  (function () {
+    // 广告拦截插件可能拦掉 SDK：判断一下再渲染，失败就保留「直达支付页」链接
+    if (!window.paypal || !window.paypal.HostedButtons) return;
+    try {
+      window.paypal.HostedButtons({ hostedButtonId: '3EL6CKZ57Y8NE' })
+        .render('#paypal-container-3EL6CKZ57Y8NE');
+    } catch (e) {
+      console.warn('PayPal hosted button failed to render', e);
+    }
+  })();
+</script>
+</body>
+</html>

@@ -164,14 +164,20 @@ assets/donate/                # 打赏二维码
 
 如果这个脚本帮你省了时间，可以请我喝杯咖啡 ☕ 完全自愿，不打赏也照常全功能使用。
 
+[![Donate with PayPal](https://img.shields.io/badge/Donate-PayPal-00457C?logo=paypal&logoColor=white)](https://www.paypal.com/ncp/payment/3EL6CKZ57Y8NE)
+[![打赏页](https://img.shields.io/badge/%E6%89%93%E8%B5%8F-%E5%BE%AE%E4%BF%A1%20%2F%20%E6%94%AF%E4%BB%98%E5%AE%9D-1AAD19)](https://ChaunceyXCX.github.io/cloudflare-free-usage-panel/donate.html)
+
 | 微信 | 支付宝 |
 |:---:|:---:|
 | <img src="assets/donate/wechat.png" width="220" alt="微信赞赏码"> | <img src="assets/donate/alipay.png" width="220" alt="支付宝收款码"> |
 
-- PayPal：<https://paypal.me/your-paypal-id>（占位，替换成你的 PayPal.Me 链接）
+- **PayPal（支持信用卡，无需账号）**：<https://www.paypal.com/ncp/payment/3EL6CKZ57Y8NE>
+- **打赏页（含微信 / 支付宝 / PayPal 按钮）**：<https://ChaunceyXCX.github.io/cloudflare-free-usage-panel/donate.html>
 - 更省事的方式：点个 **Star** ⭐ 或提个 Issue，对我来说同等重要。
 
-> ⚠️ 上面的两张图目前是**占位图**，替换方法见 [`assets/donate/README.md`](assets/donate/README.md)：把自己的收款码存成同名的 `wechat.png` / `alipay.png` 覆盖即可。
+> ⚠️ 目录里的两张二维码目前是**占位图**，替换方法见 [`assets/donate/README.md`](assets/donate/README.md)：把自己的收款码存成同名的 `wechat.png` / `alipay.png` 覆盖即可。
+
+> 💡 GitHub 的 README 会过滤 `<script>`，所以 PayPal 托管按钮（Hosted Buttons）不能直接嵌在 README 里 —— 它被放在 GitHub Pages 的 [`docs/donate.html`](docs/donate.html) 打赏页上。
 
 ## 许可
 
@@ -179,4 +185,4 @@ assets/donate/                # 打赏二维码
 
 ---
 
-如果它帮到了你，顺手点个 ⭐ [Star](https://github.com/ChaunceyXCX/cloudflare-free-usage-panel) 是唯一的「收益」。
+如果它帮到了你，顺手点个 ⭐ [Star](https://github.com/ChaunceyXCX/cloudflare-free-usage-panel) 呗。

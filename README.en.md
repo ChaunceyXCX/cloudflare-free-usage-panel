@@ -158,14 +158,20 @@ assets/donate/                # donation QR codes
 
 If this saved you some time, you can buy me a coffee ☕ Totally optional — every feature works without it.
 
+[![Donate with PayPal](https://img.shields.io/badge/Donate-PayPal-00457C?logo=paypal&logoColor=white)](https://www.paypal.com/ncp/payment/3EL6CKZ57Y8NE)
+[![Donate page](https://img.shields.io/badge/Donate-WeChat%20%2F%20Alipay-1AAD19)](https://ChaunceyXCX.github.io/cloudflare-free-usage-panel/donate.html)
+
 | WeChat Pay | Alipay |
 |:---:|:---:|
 | <img src="assets/donate/wechat.png" width="220" alt="WeChat Pay QR"> | <img src="assets/donate/alipay.png" width="220" alt="Alipay QR"> |
 
-- PayPal: <https://paypal.me/your-paypal-id> (placeholder — replace with your PayPal.Me link)
+- **PayPal (cards accepted, no account needed)**: <https://www.paypal.com/ncp/payment/3EL6CKZ57Y8NE>
+- **Donation page (WeChat / Alipay / PayPal button)**: <https://ChaunceyXCX.github.io/cloudflare-free-usage-panel/donate.html>
 - Even easier: leave a **Star** ⭐ or open an issue. That counts just as much.
 
-> ⚠️ Both images above are **placeholders**. See [`assets/donate/README.md`](assets/donate/README.md) — drop your own QR codes in as `wechat.png` / `alipay.png`.
+> ⚠️ Both QR images are **placeholders** — see [`assets/donate/README.md`](assets/donate/README.md), drop your own codes in as `wechat.png` / `alipay.png`.
+
+> 💡 GitHub strips `<script>` from READMEs, so the PayPal Hosted Button can't live there — it is embedded in [`docs/donate.html`](docs/donate.html) on GitHub Pages.
 
 ## License
 
@@ -173,4 +179,4 @@ If this saved you some time, you can buy me a coffee ☕ Totally optional — ev
 
 ---
 
-If it helped, a ⭐ [Star](https://github.com/ChaunceyXCX/cloudflare-free-usage-panel) is the only payment.
+If it helped, please leave a ⭐ [Star](https://github.com/ChaunceyXCX/cloudflare-free-usage-panel) .
