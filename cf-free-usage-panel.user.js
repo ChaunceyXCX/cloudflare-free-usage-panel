@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cloudflare 免费额度用量面板
 // @namespace    https://dash.cloudflare.com/cf-free-usage
-// @version      1.2.0
+// @version      1.3.0
 // @description  在 Cloudflare 控制台里用进度条直观查看 Workers / KV / D1 / R2 / Queues / DO / Workers AI 等免费额度的实时使用量
 // @author       chauncey
 // @match        https://dash.cloudflare.com/*
@@ -36,7 +36,7 @@
   'use strict';
 
   const GB = 1024 ** 3;
-  const VERSION = '1.2.0';
+  const VERSION = '1.3.0';
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   /* =========================================================================
@@ -87,6 +87,7 @@
     mode: 'cfu.mode', token: 'cfu.token', account: 'cfu.account',
     accounts: 'cfu.accounts', snapshot: 'cfu.snapshot', open: 'cfu.open',
     interval: 'cfu.interval', variants: 'cfu.variants',
+    launcherPos: 'cfu.launcherPos', panelPos: 'cfu.panelPos',
   };
 
   const store = {
@@ -653,6 +654,8 @@
       box-shadow: 0 6px 20px rgba(0,0,0,.35); transition: transform .15s ease, box-shadow .15s ease;
     }
     .launcher:hover { transform: translateY(-2px); box-shadow: 0 10px 26px rgba(246,130,31,.45); }
+    .launcher { touch-action: none; }
+    .launcher.dragging { cursor: grabbing; transform: none; box-shadow: 0 4px 14px rgba(0,0,0,.4); }
     .panel {
       position: fixed; right: 22px; bottom: 22px; z-index: 2147483000;
       width: 396px; max-height: min(78vh, 760px); display: flex; flex-direction: column;
@@ -663,7 +666,11 @@
     header {
       display: flex; align-items: center; gap: 8px; padding: 12px 14px;
       background: #1b1e25; border-bottom: 1px solid #262a33;
+      cursor: grab; touch-action: none; user-select: none;
     }
+    .panel.dragging { transition: none; }
+    .panel.dragging header { cursor: grabbing; }
+    .panel.dragging * { user-select: none; }
     header .t { font-size: 13.5px; font-weight: 650; letter-spacing: .2px; }
     header .dot { width: 7px; height: 7px; border-radius: 50%; background: #f6821f; box-shadow: 0 0 8px #f6821f; }
     header .sp { flex: 1; }
@@ -773,6 +780,105 @@
     return row;
   }
 
+  /* ---------- 拖拽定位 ---------- */
+  const clampNum = (v, min, max) => Math.min(Math.max(v, min), Math.max(min, max));
+
+  function pinToLeftTop(el, x, y) {
+    el.style.left = `${x}px`;
+    el.style.top = `${y}px`;
+    el.style.right = 'auto';
+    el.style.bottom = 'auto';
+  }
+
+  // 把元素拉回视口内（缩小窗口、切换分辨率后需要）
+  function keepInView(el) {
+    const rect = el.getBoundingClientRect();
+    if (!rect.width && !rect.height) return;
+    const x = clampNum(rect.left, 8, window.innerWidth - rect.width - 8);
+    const y = clampNum(rect.top, 8, window.innerHeight - rect.height - 8);
+    if (x !== rect.left || y !== rect.top) pinToLeftTop(el, x, y);
+  }
+
+  function applyStoredPos(el, key) {
+    const pos = store.get(key, null);
+    if (!pos || typeof pos.x !== 'number' || typeof pos.y !== 'number') return false;
+    pinToLeftTop(el, pos.x, pos.y);
+    return true;
+  }
+
+  function resetPos(el, key) {
+    for (const prop of ['left', 'top', 'right', 'bottom']) el.style.removeProperty(prop);
+    store.set(key, null);
+  }
+
+  /*
+   * 通用指针拖拽：按住 handle 拖动整个 el。
+   * 拖动过程中会把 right/bottom 定位换算成 left/top，松手后落盘坐标。
+   * 返回值 suppressClick 用于吞掉「拖完顺带触发的 click」。
+   */
+  function draggable(el, handle, opts = {}) {
+    const api = { suppressClick: false, dragging: false };
+    let pid = null;
+    let startX = 0;
+    let startY = 0;
+    let baseX = 0;
+    let baseY = 0;
+    let moved = false;
+
+    const onDown = (ev) => {
+      if (ev.button != null && ev.button !== 0) return;
+      if (opts.ignore && ev.target.closest && ev.target.closest(opts.ignore)) return;
+      const rect = el.getBoundingClientRect();
+      pinToLeftTop(el, rect.left, rect.top);
+      startX = ev.clientX;
+      startY = ev.clientY;
+      baseX = rect.left;
+      baseY = rect.top;
+      moved = false;
+      api.dragging = true;
+      pid = ev.pointerId;
+      el.classList.add('dragging');
+      try { handle.setPointerCapture?.(ev.pointerId); } catch (e) { /* 忽略 */ }
+      ev.preventDefault();
+    };
+
+    const onMove = (ev) => {
+      if (!api.dragging) return;
+      if (pid != null && ev.pointerId != null && ev.pointerId !== pid) return;
+      const dx = (ev.clientX || 0) - startX;
+      const dy = (ev.clientY || 0) - startY;
+      if (!moved && Math.abs(dx) < 3 && Math.abs(dy) < 3) return;
+      moved = true;
+      const rect = el.getBoundingClientRect();
+      pinToLeftTop(
+        el,
+        clampNum(baseX + dx, 8, window.innerWidth - rect.width - 8),
+        clampNum(baseY + dy, 8, window.innerHeight - rect.height - 8),
+      );
+      ev.preventDefault();
+    };
+
+    const onUp = () => {
+      if (!api.dragging) return;
+      api.dragging = false;
+      pid = null;
+      el.classList.remove('dragging');
+      if (!moved) return;
+      api.suppressClick = true;
+      if (opts.key) {
+        const rect = el.getBoundingClientRect();
+        store.set(opts.key, { x: Math.round(rect.left), y: Math.round(rect.top) });
+      }
+      if (opts.onDrop) opts.onDrop();
+    };
+
+    handle.addEventListener('pointerdown', onDown);
+    handle.addEventListener('pointermove', onMove);
+    handle.addEventListener('pointerup', onUp);
+    handle.addEventListener('pointercancel', onUp);
+    return api;
+  }
+
   function mount() {
     if (document.getElementById(HOST_ID)) return null;
     const host = document.createElement('div');
@@ -821,6 +927,14 @@
       clearTimeout(ui.toastTimer);
       ui.toastTimer = setTimeout(() => ui.toastEl.classList.remove('on'), 6000);
     };
+
+    // 悬浮球整体可拖，面板用头部作为拖拽把手（避开按钮）
+    ui.launcherDrag = draggable(launcher, launcher, { key: KEY.launcherPos });
+    ui.panelDrag = draggable(panel, panel.querySelector('header'), { ignore: '[data-act]', key: KEY.panelPos });
+
+    applyStoredPos(launcher, KEY.launcherPos);
+    applyStoredPos(panel, KEY.panelPos);
+    requestAnimationFrame(() => keepInView(launcher));
     return ui;
   }
 
@@ -950,6 +1064,7 @@
         <button class="btn primary" data-act="save">保存并刷新</button>
         <button class="btn" data-act="test">测试连接</button>
         <button class="btn" data-act="clearcache">清除缓存</button>
+        <button class="btn" data-act="resetpos">重置位置</button>
       </div>
 
       <h4>诊断信息</h4>
@@ -1022,6 +1137,12 @@
       ui.toast('已清除本地缓存');
     });
 
+    cfg.querySelector('[data-act=resetpos]').addEventListener('click', () => {
+      resetPos(ui.panel, KEY.panelPos);
+      resetPos(ui.launcher, KEY.launcherPos);
+      ui.toast('位置已重置');
+    });
+
     cfg.querySelector('[data-act=copy]').addEventListener('click', async () => {
       const text = diagText();
       try {
@@ -1055,6 +1176,7 @@
     store.set(KEY.open, next);
     if (next) {
       showSettings(false);
+      keepInView(ui.panel);
       renderMeta();
       renderBody();
       const stale = !state.snapshot || Date.now() - (state.snapshot.ts || 0) > 60_000;
@@ -1162,7 +1284,19 @@
   }
 
   function bind() {
-    ui.launcher.addEventListener('click', () => togglePanel(true));
+    ui.launcher.addEventListener('click', () => {
+      // 拖动结束时浏览器还会补一个 click，别让它把面板弹出来
+      if (ui.launcherDrag && ui.launcherDrag.suppressClick) {
+        ui.launcherDrag.suppressClick = false;
+        return;
+      }
+      togglePanel(true);
+    });
+
+    window.addEventListener('resize', () => {
+      keepInView(ui.launcher);
+      keepInView(ui.panel);
+    });
     ui.panel.addEventListener('click', (ev) => {
       const t = ev.target.closest('[data-act]');
       if (!t) {

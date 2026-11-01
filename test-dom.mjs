@@ -117,6 +117,47 @@ settingsBtn.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
 assert(settingsBtn.textContent === '设置', '返回后按钮文案恢复为「设置」');
 assert(root.querySelector('[data-el=body]').style.display === 'block', '返回后用量列表恢复显示');
 
+
+// ---- 拖拽：悬浮球 ----
+const pointer = (el, type, x, y) => el.dispatchEvent(new window.MouseEvent(type, { clientX: x, clientY: y, bubbles: true }));
+const drag = (el, from, to) => {
+  pointer(el, 'pointerdown', from[0], from[1]);
+  pointer(el, 'pointermove', to[0], to[1]);
+  pointer(el, 'pointerup', to[0], to[1]);
+};
+
+// 先关掉面板，验证「拖动后不应误触展开」
+root.querySelector('[data-act=close]').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+assert(panel.dataset.hidden === '1', '拖拽测试前先收起面板');
+
+drag(launcher, [200, 200], [320, 260]);
+assert(launcher.style.left === '120px' && launcher.style.top === '60px', `悬浮球按位移移动（left=${launcher.style.left}, top=${launcher.style.top}）`);
+assert(launcher.style.right === 'auto' && launcher.style.bottom === 'auto', '定位从 right/bottom 切换为 left/top');
+assert(store.has('cfu.launcherPos'), '悬浮球坐标已落盘');
+
+launcher.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+assert(panel.dataset.hidden === '1', '拖动结束补发的 click 被吞掉（面板不弹出）');
+launcher.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+assert(panel.dataset.hidden === '0', '无拖动的正常点击仍能展开面板');
+
+// ---- 拖拽：面板（头部把手） ----
+const header = panel.querySelector('header');
+drag(header, [400, 100], [450, 130]);
+assert(panel.style.left === '50px' && panel.style.top === '30px', `面板随头部拖动（left=${panel.style.left}, top=${panel.style.top}）`);
+assert(store.has('cfu.panelPos'), '面板坐标已落盘');
+
+// 头部按钮上的操作不应触发拖拽
+const leftBefore = panel.style.left;
+drag(root.querySelector('[data-act=refresh]'), [400, 100], [600, 300]);
+assert(panel.style.left === leftBefore, '按住头部按钮拖动不会移动面板');
+
+// ---- 重置位置 ----
+root.querySelector('[data-act=settings]').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+root.querySelector('[data-act=resetpos]').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+assert(panel.style.left === '' && panel.style.top === '', '重置后面板回到 CSS 默认位置');
+assert(store.get('cfu.panelPos', 'x') === null && store.get('cfu.launcherPos', 'x') === null, '重置后坐标记录被清空');
+root.querySelector('[data-act=settings]').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+
 // ---- 全灭 403：保留上次数据 + 元信息提示，不清空面板 ----
 force403 = true;
 const before = txt('workersReq');
